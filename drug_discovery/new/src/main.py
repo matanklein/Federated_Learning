@@ -161,17 +161,31 @@ def estimate_dp_clip(base_conf, data_dir, device, n_batches=20):
     model = sc.TrunkAndHead(conf=c, trunk=sc.Trunk(c)).to(device)
     loss_fn = torch.nn.BCEWithLogitsLoss(reduction="none")
     optimizer = torch.optim.Adam(model.parameters(), lr=c.lr, weight_decay=c.weight_decay)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=c.batch_size, shuffle=True, collate_fn=dataset.collate)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=c.batch_size, shuffle=True, collate_fn=sc.sparse_collate)
 
     norms = []
     model.train()
     for i, batch in enumerate(loader):
         if i >= n_batches: break
-        b_x, b_y = batch["ecfp"].to(device), batch["ic50"].to(device)
+        
+        # Construct the PyTorch sparse tensor for the input
+        b_x = torch.sparse_coo_tensor(
+            batch["x_ind"], 
+            batch["x_data"], 
+            size=[batch["batch_size"], c.input_size]
+        ).to(device)
+        
+        y_ind = batch["y_ind"].to(device)
+        y_data = batch["y_data"].to(device)
+
         optimizer.zero_grad()
+        
+        # Pass the sparse tensor to the model
         logits = model(b_x)
-        mask = ~torch.isnan(b_y)
-        loss = loss_fn(logits[mask], b_y[mask]).mean()
+        
+        # Compute loss ONLY on the known sparse labels to save memory
+        logits_subset = logits[y_ind[0], y_ind[1]]
+        loss = loss_fn(logits_subset, y_data).mean()
         loss.backward()
 
         total_norm = 0.0
@@ -206,17 +220,30 @@ def evaluate_global_model(model, test_dataset, conf, loss_fn, device):
     """Calculates evaluation loss. The model retains its personalized Head while evaluating."""
     model.to(device)
     model.eval()
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=conf.batch_size, collate_fn=test_dataset.collate)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=conf.batch_size, collate_fn=sc.sparse_collate)
+    
     total_loss, samples = 0.0, 0
     with torch.no_grad():
         for batch in test_loader:
-            b_x, b_y = batch["ecfp"].to(device), batch["ic50"].to(device)
+            # Construct the PyTorch sparse tensor
+            b_x = torch.sparse_coo_tensor(
+                batch["x_ind"], 
+                batch["x_data"], 
+                size=[batch["batch_size"], conf.input_size]
+            ).to(device)
+            
+            y_ind = batch["y_ind"].to(device)
+            y_data = batch["y_data"].to(device)
+            
             logits = model(b_x)
-            mask = ~torch.isnan(b_y)
-            if mask.sum() > 0:
-                loss = loss_fn(logits[mask], b_y[mask])
+            
+            # Extract only the active target predictions
+            logits_subset = logits[y_ind[0], y_ind[1]]
+            if logits_subset.numel() > 0:
+                loss = loss_fn(logits_subset, y_data)
                 total_loss += loss.sum().item()
-                samples += mask.sum().item()
+                samples += logits_subset.numel()
+                
     return total_loss / max(samples, 1)
 
 def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, dp_clip, args, loss_fn, device):
@@ -241,7 +268,9 @@ def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, 
     strategy = SaveModelStrategy(
         target_rounds=args.rounds,
         fraction_fit=1.0, fraction_evaluate=1.0,
-        min_fit_clients=len(group), min_available_clients=len(group),
+        min_fit_clients=len(group),
+        min_evaluate_clients=len(group), 
+        min_available_clients=len(group),
     )
 
     fl.simulation.start_simulation(
@@ -249,7 +278,7 @@ def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, 
         num_clients=len(group),
         config=fl.server.ServerConfig(num_rounds=args.rounds),
         strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.0 if device.type == 'cpu' else 1.0},
+        client_resources={"num_cpus": 1, "num_gpus": 0.0 if device.type == 'cpu' else 0.5},
     )
     
     # Calculate performance using the global trunk + personalized local head
