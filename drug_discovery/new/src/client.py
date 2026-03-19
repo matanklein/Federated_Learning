@@ -3,14 +3,6 @@ import torch
 import numpy as np
 from collections import OrderedDict
 
-def get_parameters(model):
-    return [val.cpu().numpy() for _, val in model.state_dict().items()]
-
-def set_parameters(model, parameters):
-    params_dict = zip(model.state_dict().keys(), parameters)
-    state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-    model.load_state_dict(state_dict, strict=True)
-
 class DrugDiscoveryClient(fl.client.NumPyClient):
     def __init__(self, model, train_dataset, test_dataset, conf, loss_fn, privacy_mode, privacy_param, dp_clip=None):
         self.model = model
@@ -25,10 +17,14 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
         self.model.to(self.device)
 
     def get_parameters(self, config):
-        return get_parameters(self.model)
+        # FIX 1: Only extract the Trunk parameters for Server Aggregation
+        return [val.cpu().numpy() for _, val in self.model.trunk.state_dict().items()]
 
     def set_parameters(self, parameters):
-        set_parameters(self.model, parameters)
+        # FIX 1: Only overwrite the local Trunk. The local Head remains isolated.
+        params_dict = zip(self.model.trunk.state_dict().keys(), parameters)
+        state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+        self.model.trunk.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
@@ -42,26 +38,32 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
         for batch in train_loader:
             b_x, b_y = batch["ecfp"].to(self.device), batch["ic50"].to(self.device)
             optimizer.zero_grad()
+            
             logits = self.model(b_x)
             mask = ~torch.isnan(b_y)
-            loss = self.loss_fn(logits[mask], b_y[mask])
-            loss.mean().backward()
+            # Ensure mean is taken so gradients scale properly
+            loss = self.loss_fn(logits[mask], b_y[mask]).mean()
+            loss.backward()
+
+            # FIX 2: Apply true DP-SGD to the Trunk parameters during backprop
+            if self.privacy_mode == 'dp' and self.privacy_param > 0.0 and self.dp_clip is not None:
+                # 1. Clip Trunk gradients
+                torch.nn.utils.clip_grad_norm_(self.model.trunk.parameters(), max_norm=self.dp_clip)
+                
+                # 2. Add Abadi et al. Gaussian noise to Trunk gradients
+                for p in self.model.trunk.parameters():
+                    if p.grad is not None:
+                        noise = torch.normal(
+                            mean=0.0, 
+                            std=self.privacy_param * self.dp_clip, 
+                            size=p.grad.shape
+                        ).to(self.device)
+                        p.grad += noise
+
             optimizer.step()
 
-        # Extract updated weights
-        updated_parameters = self.get_parameters(config={})
-
-        # Apply Local Differential Privacy if mode is 'dp'
-        if self.privacy_mode == 'dp' and self.privacy_param > 0.0:
-            noised_parameters = []
-            for param in updated_parameters:
-                # Add Gaussian noise proportional to privacy_param
-                # Modify the scale (std dev) here if your original article used a specific sensitivity bound
-                noise = np.random.normal(loc=0.0, scale=self.privacy_param, size=param.shape)
-                noised_parameters.append(param + noise)
-            updated_parameters = noised_parameters
-
-        return updated_parameters, len(self.train_dataset), {}
+        # Returns ONLY the Trunk parameters
+        return self.get_parameters(config={}), len(self.train_dataset), {}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
@@ -82,9 +84,10 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
                 b_y = batch["ic50"].to(self.device)
                 logits = self.model(b_x)
                 mask = ~torch.isnan(b_y)
-                loss = self.loss_fn(logits[mask], b_y[mask])
-                total_loss += loss.sum().item()
-                samples += mask.sum().item()
+                if mask.sum() > 0:
+                    loss = self.loss_fn(logits[mask], b_y[mask])
+                    total_loss += loss.sum().item()
+                    samples += mask.sum().item()
                 
         avg_loss = total_loss / max(samples, 1)
         return float(avg_loss), len(self.test_dataset), {"loss": float(avg_loss)}
