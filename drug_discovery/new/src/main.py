@@ -248,29 +248,35 @@ def evaluate_global_model(model, test_dataset, conf, loss_fn, device):
 
 def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, dp_clip, args, loss_fn, device):
     """Executes a Flower simulation and returns final losses for the given clients."""
-    client_models = {}
-    test_datasets = {}
     path_suffix = os.path.join(data_dir, "data_2_split/")
+    head_dir = args.results 
+    
+    # Clean up old persistent heads before starting a fresh simulation
+    for k in group:
+        hp = os.path.join(head_dir, f"head_{k}.pt")
+        if os.path.exists(hp): os.remove(hp)
 
     def client_fn(cid: str) -> fl.client.Client:
-        k = int(cid)
-        p_val = privacy_params[group.index(k)]
+        # Flower always gives cid from "0" to "num_clients - 1"
+        flower_id = int(cid) 
+        
+        # Map Flower's internal ID to your actual client (0 or 1)
+        k = group[flower_id]
+        p_val = privacy_params[flower_id]
         
         train_ds, test_ds = get_client_datasets(path_suffix, k, p_val, privacy_mode, base_conf)
-        test_datasets[k] = test_ds
-        
         trunk = sc.Trunk(base_conf)
         model = sc.TrunkAndHead(conf=base_conf, trunk=trunk)
-        client_models[k] = model
         
-        return DrugDiscoveryClient(model, train_ds, test_ds, base_conf, loss_fn, privacy_mode, p_val, dp_clip).to_client()
+        # Pass k so it loads/saves the correct head_0.pt or head_1.pt
+        return DrugDiscoveryClient(
+            model, train_ds, test_ds, base_conf, loss_fn, privacy_mode, p_val, dp_clip, k, head_dir
+        ).to_client()
 
     strategy = SaveModelStrategy(
         target_rounds=args.rounds,
         fraction_fit=1.0, fraction_evaluate=1.0,
-        min_fit_clients=len(group),
-        min_evaluate_clients=len(group), 
-        min_available_clients=len(group),
+        min_fit_clients=len(group), min_evaluate_clients=len(group), min_available_clients=len(group),
     )
 
     fl.simulation.start_simulation(
@@ -278,19 +284,30 @@ def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, 
         num_clients=len(group),
         config=fl.server.ServerConfig(num_rounds=args.rounds),
         strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.0 if device.type == 'cpu' else 0.5},
+        client_resources={"num_cpus": 1, "num_gpus": 0.0 if device.type == 'cpu' else 1.0},
     )
     
     # Calculate performance using the global trunk + personalized local head
     final_losses = []
     for k in group:
-        model = client_models[k]
+        # 1. Instantiate a fresh model in the main process
+        _, test_ds = get_client_datasets(path_suffix, k, 0.0, 'suppression', base_conf)
+        trunk = sc.Trunk(base_conf)
+        model = sc.TrunkAndHead(conf=base_conf, trunk=trunk)
+        
+        # 2. Load the personalized Head that the worker saved to disk
+        hp = os.path.join(head_dir, f"head_{k}.pt")
+        if os.path.exists(hp):
+            model.load_state_dict(torch.load(hp), strict=False)
+            
+        # 3. Load the final aggregated Trunk from the server
         if strategy.final_parameters is not None:
             params_dict = zip(model.trunk.state_dict().keys(), strategy.final_parameters)
             state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
             model.trunk.load_state_dict(state_dict, strict=True)
             
-        loss = evaluate_global_model(model, test_datasets[k], base_conf, loss_fn, device)
+        # 4. Evaluate and append
+        loss = evaluate_global_model(model, test_ds, base_conf, loss_fn, device)
         final_losses.append(loss)
         
     return final_losses
