@@ -5,6 +5,14 @@ import os
 from collections import OrderedDict
 import sparsechem as sc
 
+def get_parameters(model):
+    return [val.cpu().numpy() for _, val in model.state_dict().items()]
+
+def set_parameters(model, parameters):
+    params_dict = zip(model.state_dict().keys(), parameters)
+    state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+    model.load_state_dict(state_dict, strict=True)
+
 class DrugDiscoveryClient(fl.client.NumPyClient):
     def __init__(self, model, train_dataset, test_dataset, conf, loss_fn, privacy_mode, privacy_param, dp_clip, cid, head_dir):
         self.model = model
@@ -16,14 +24,16 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
         self.privacy_param = privacy_param
         self.dp_clip = dp_clip
         self.cid = cid
+        self.head_dir = head_dir
+        
         self.head_path = os.path.join(head_dir, f"head_{cid}.pt")
+        self.optim_path = os.path.join(head_dir, f"optim_{cid}.pt") # New Optimizer State Path
+        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
-        # FIX: Load personalized Head state to persist learning across Flower's stateless Ray actors
         if os.path.exists(self.head_path):
-            head_state = torch.load(self.head_path)
-            self.model.load_state_dict(head_state, strict=False)
+            self.model.load_state_dict(torch.load(self.head_path, map_location=self.device), strict=False)
 
     def get_parameters(self, config):
         return [val.cpu().numpy() for _, val in self.model.trunk.state_dict().items()]
@@ -36,23 +46,35 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
     def fit(self, parameters, config):
         self.set_parameters(parameters)
         
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.conf.lr, weight_decay=self.conf.weight_decay)
+        
+        # FIX 1: Restore Adam Momentum
+        if os.path.exists(self.optim_path):
+            optimizer.load_state_dict(torch.load(self.optim_path, map_location=self.device))
+            
         train_loader = torch.utils.data.DataLoader(
             self.train_dataset, batch_size=self.conf.batch_size, shuffle=True, collate_fn=sc.sparse_collate
         )
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.conf.lr, weight_decay=self.conf.weight_decay)
         
         self.model.train()
-        for batch in train_loader:
-            b_x = torch.sparse_coo_tensor(
-                batch["x_ind"], batch["x_data"], size=[batch["batch_size"], self.conf.input_size]
-            ).to(self.device)
+        
+        # FIX 2: Process exactly ONE BATCH to stop Client Drift and mirror old code
+        try:
+            batch = next(iter(train_loader))
+        except StopIteration:
+            return self.get_parameters(config={}), len(self.train_dataset), {}
             
-            y_ind, y_data = batch["y_ind"].to(self.device), batch["y_data"].to(self.device)
-            
-            optimizer.zero_grad()
-            logits = self.model(b_x)
-            
-            logits_subset = logits[y_ind[0], y_ind[1]]
+        b_x = torch.sparse_coo_tensor(
+            batch["x_ind"], batch["x_data"], size=[batch["batch_size"], self.conf.input_size]
+        ).to(self.device)
+        
+        y_ind, y_data = batch["y_ind"].to(self.device), batch["y_data"].to(self.device)
+        
+        optimizer.zero_grad()
+        logits = self.model(b_x)
+        
+        logits_subset = logits[y_ind[0], y_ind[1]]
+        if logits_subset.numel() > 0:
             loss = self.loss_fn(logits_subset, y_data).mean()
             loss.backward()
 
@@ -65,13 +87,18 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
 
             optimizer.step()
 
-        # FIX: Save the Head state to disk before this worker shuts down
+        # Save Optimizer and Head
+        torch.save(optimizer.state_dict(), self.optim_path)
         head_state = {k: v for k, v in self.model.state_dict().items() if 'trunk' not in k}
         torch.save(head_state, self.head_path)
+
+        # Free memory to prevent Seed crashing
+        torch.cuda.empty_cache()
 
         return self.get_parameters(config={}), len(self.train_dataset), {}
 
     def evaluate(self, parameters, config):
+        # Your existing evaluate code remains exactly the same
         self.set_parameters(parameters)
         test_loader = torch.utils.data.DataLoader(
             self.test_dataset, batch_size=self.conf.batch_size, collate_fn=sc.sparse_collate

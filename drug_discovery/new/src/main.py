@@ -246,7 +246,7 @@ def evaluate_global_model(model, test_dataset, conf, loss_fn, device):
                 
     return total_loss / max(samples, 1)
 
-def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, dp_clip, args, loss_fn, device):
+def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, dp_clip, args, loss_fn, device, seed):
     """Executes a Flower simulation and returns final losses for the given clients."""
     path_suffix = os.path.join(data_dir, "data_2_split/")
     head_dir = args.results 
@@ -254,29 +254,53 @@ def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, 
     # Clean up old persistent heads before starting a fresh simulation
     for k in group:
         hp = os.path.join(head_dir, f"head_{k}.pt")
+        op = os.path.join(head_dir, f"optim_{k}.pt")
         if os.path.exists(hp): os.remove(hp)
+        if os.path.exists(op): os.remove(op)
+
+    # FIX 1: Pre-load datasets to ensure suppression consistency across rounds!
+    set_seed(seed)
+    client_datasets = {}
+    for flower_id, k in enumerate(group):
+        p_val = privacy_params[flower_id]
+        client_datasets[k] = get_client_datasets(path_suffix, k, p_val, privacy_mode, base_conf)
+
+    # FIX 2: Ensure all clients start from the EXACT SAME initial weights as the Oracle
+    set_seed(seed)
+    initial_model = sc.TrunkAndHead(conf=base_conf, trunk=sc.Trunk(base_conf))
+    
+    # Extract trunk parameters to give to the Flower Server
+    initial_trunk_params = fl.common.ndarrays_to_parameters(
+        [val.cpu().numpy() for _, val in initial_model.trunk.state_dict().items()]
+    )
+    # Extract head parameters to inject into clients
+    initial_head_state = {k: v for k, v in initial_model.state_dict().items() if 'trunk' not in k}
 
     def client_fn(cid: str) -> fl.client.Client:
-        # Flower always gives cid from "0" to "num_clients - 1"
-        flower_id = int(cid) 
-        
-        # Map Flower's internal ID to your actual client (0 or 1)
-        k = group[flower_id]
-        p_val = privacy_params[flower_id]
-        
-        train_ds, test_ds = get_client_datasets(path_suffix, k, p_val, privacy_mode, base_conf)
-        trunk = sc.Trunk(base_conf)
-        model = sc.TrunkAndHead(conf=base_conf, trunk=trunk)
-        
-        # Pass k so it loads/saves the correct head_0.pt or head_1.pt
-        return DrugDiscoveryClient(
-            model, train_ds, test_ds, base_conf, loss_fn, privacy_mode, p_val, dp_clip, k, head_dir
-        ).to_client()
+            flower_id = int(cid) 
+            k = group[flower_id]
+            p_val = privacy_params[flower_id]
+            
+            # Pull fixed dataset from closure
+            train_ds, test_ds = client_datasets[k]
+            
+            trunk = sc.Trunk(base_conf)
+            model = sc.TrunkAndHead(conf=base_conf, trunk=trunk)
+            
+            # Force deterministic Head initialization on Round 1
+            hp = os.path.join(head_dir, f"head_{k}.pt")
+            if not os.path.exists(hp):
+                model.load_state_dict(initial_head_state, strict=False)
+            
+            return DrugDiscoveryClient(
+                model, train_ds, test_ds, base_conf, loss_fn, privacy_mode, p_val, dp_clip, k, head_dir
+            ).to_client()
 
     strategy = SaveModelStrategy(
         target_rounds=args.rounds,
         fraction_fit=1.0, fraction_evaluate=1.0,
         min_fit_clients=len(group), min_evaluate_clients=len(group), min_available_clients=len(group),
+        initial_parameters=initial_trunk_params  # FIX 3: Push deterministic trunk to server
     )
 
     fl.simulation.start_simulation(
@@ -286,43 +310,40 @@ def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, 
         strategy=strategy,
         client_resources={"num_cpus": 1, "num_gpus": 0.0 if device.type == 'cpu' else 1.0},
     )
-    
+        
     # Calculate performance using the global trunk + personalized local head
     final_losses = []
     for k in group:
-        # 1. Instantiate a fresh model in the main process
         _, test_ds = get_client_datasets(path_suffix, k, 0.0, 'suppression', base_conf)
         trunk = sc.Trunk(base_conf)
         model = sc.TrunkAndHead(conf=base_conf, trunk=trunk)
         
-        # 2. Load the personalized Head that the worker saved to disk
         hp = os.path.join(head_dir, f"head_{k}.pt")
         if os.path.exists(hp):
             model.load_state_dict(torch.load(hp), strict=False)
             
-        # 3. Load the final aggregated Trunk from the server
         if strategy.final_parameters is not None:
             params_dict = zip(model.trunk.state_dict().keys(), strategy.final_parameters)
             state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
             model.trunk.load_state_dict(state_dict, strict=True)
             
-        # 4. Evaluate and append
         loss = evaluate_global_model(model, test_ds, base_conf, loss_fn, device)
         final_losses.append(loss)
         
     return final_losses
 
-def run_local(client_idx, data_dir, base_conf, dp_clip, args, loss_fn, device):
+def run_local(client_idx, data_dir, base_conf, dp_clip, args, loss_fn, device, seed):
     """Evaluates untouched (Oracle) model, then trains a local model via 1-client FL instance."""
     path_suffix = os.path.join(data_dir, "data_2_split/")
     _, test_ds = get_client_datasets(path_suffix, client_idx, 0.0, 'suppression', base_conf)
     
     # Untrained model for Oracle
+    set_seed(seed)
     untrained_model = sc.TrunkAndHead(conf=base_conf, trunk=sc.Trunk(base_conf))
     oracle_loss = evaluate_global_model(untrained_model, test_ds, base_conf, loss_fn, device)
     
     # Standard local training wrapped in Flower engine (1 round equivalent local passes)
-    losses = run_fl_experiment(data_dir, [client_idx], 'suppression', [0.0], base_conf, dp_clip, args, loss_fn, device)
+    losses = run_fl_experiment(data_dir, [client_idx], 'suppression', [0.0], base_conf, dp_clip, args, loss_fn, device, seed)
     return oracle_loss, losses[0]
 
 # --- Output Orchestration ---
@@ -392,9 +413,9 @@ def run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip,
         for sname, (data_dir, lbl0, lbl1) in scenarios.items():
             print(f"\n  [{sname}]  {lbl0} vs {lbl1}")
             set_seed(seed)
-            oracle0, local0 = run_local(0, data_dir, base_conf, dp_clip, args, loss_fn, device)
+            oracle0, local0 = run_local(0, data_dir, base_conf, dp_clip, args, loss_fn, device, seed)
             set_seed(seed)
-            oracle1, local1 = run_local(1, data_dir, base_conf, dp_clip, args, loss_fn, device)
+            oracle1, local1 = run_local(1, data_dir, base_conf, dp_clip, args, loss_fn, device, seed)
 
             print(f"      Baselines — c0: oracle={oracle0:.6f} local={local0:.6f} | c1: oracle={oracle1:.6f} local={local1:.6f}")
 
@@ -405,7 +426,7 @@ def run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip,
             for i, n0 in enumerate(dp_noise_levels):
                 for j, n1 in enumerate(dp_noise_levels):
                     set_seed(seed)
-                    j0, j1 = run_fl_experiment(data_dir, [0, 1], 'dp', [n0, n1], base_conf, dp_clip, args, loss_fn, device)
+                    j0, j1 = run_fl_experiment(data_dir, [0, 1], 'dp', [n0, n1], base_conf, dp_clip, args, loss_fn, device, seed)
                     grid_c0_dp[i, j] = norm_improvement(oracle0, local0, j0)
                     grid_c1_dp[i, j] = norm_improvement(oracle1, local1, j1)
             
@@ -421,7 +442,7 @@ def run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip,
             for i, h0 in enumerate(sup_levels):
                 for j, h1 in enumerate(sup_levels):
                     set_seed(seed)
-                    j0, j1 = run_fl_experiment(data_dir, [0, 1], 'suppression', [h0, h1], base_conf, dp_clip, args, loss_fn, device)
+                    j0, j1 = run_fl_experiment(data_dir, [0, 1], 'suppression', [h0, h1], base_conf, dp_clip, args, loss_fn, device, seed)
                     grid_c0_sup[i, j] = norm_improvement(oracle0, local0, j0)
                     grid_c1_sup[i, j] = norm_improvement(oracle1, local1, j1)
 
