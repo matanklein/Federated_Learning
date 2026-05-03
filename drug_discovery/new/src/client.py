@@ -1,9 +1,8 @@
 import flwr as fl
 import torch
-import numpy as np
 import os
-from collections import OrderedDict
 import sparsechem as sc
+from collections import OrderedDict
 
 def get_parameters(model):
     return [val.cpu().numpy() for _, val in model.state_dict().items()]
@@ -27,7 +26,7 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
         self.head_dir = head_dir
         
         self.head_path = os.path.join(head_dir, f"head_{cid}.pt")
-        self.optim_path = os.path.join(head_dir, f"optim_{cid}.pt") # New Optimizer State Path
+        # Note: We no longer need an optim_path for stateful momentum since we are moving to SGD.
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
@@ -46,9 +45,9 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
     def fit(self, parameters, config):
         self.set_parameters(parameters)
         
-        # Re-initialize the optimizer. Do NOT load local momentum states for 
-        # parameters that have just been aggregated globally by the server.
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.conf.lr, weight_decay=self.conf.weight_decay)
+        # ALIGNMENT: Replaced Adam with standard SGD to match the theoretical bounds
+        # of the collaborative learning accuracy approximation model.
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=self.conf.lr, weight_decay=self.conf.weight_decay)
             
         train_loader = torch.utils.data.DataLoader(
             self.train_dataset, batch_size=self.conf.batch_size, shuffle=True, collate_fn=sc.sparse_collate
@@ -56,8 +55,6 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
         
         self.model.train()
         
-        # Iterate over the entire dataset (1 local epoch) to ensure gradient steps 
-        # strictly correlate with the privacy parameter 'p' (dataset size reduction).
         for batch in train_loader:
             b_x = torch.sparse_coo_tensor(
                 batch["x_ind"], batch["x_data"], size=[batch["batch_size"], self.conf.input_size]
@@ -83,19 +80,15 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
 
                 optimizer.step()
 
-        # Save ONLY the personalized head state. 
+        # Save personalized head state
         head_state = {k: v for k, v in self.model.state_dict().items() if 'trunk' not in k}
         torch.save(head_state, self.head_path)
 
-        # Free memory to prevent Seed crashing
         torch.cuda.empty_cache()
 
-        # By returning len(self.train_dataset), Flower's FedAvg natively applies 
-        # a smaller aggregation weight to clients who suppressed data.
         return self.get_parameters(config={}), len(self.train_dataset), {}
 
     def evaluate(self, parameters, config):
-        # Your existing evaluate code remains exactly the same
         self.set_parameters(parameters)
         test_loader = torch.utils.data.DataLoader(
             self.test_dataset, batch_size=self.conf.batch_size, collate_fn=sc.sparse_collate
