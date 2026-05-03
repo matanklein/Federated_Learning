@@ -420,20 +420,20 @@ def run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip,
             print(f"      Baselines — c0: oracle={oracle0:.6f} local={local0:.6f} | c1: oracle={oracle1:.6f} local={local1:.6f}")
 
             # DP Grid
-            print("    DP grid ...")
-            n = len(dp_noise_levels)
-            grid_c0_dp, grid_c1_dp = np.zeros((n, n)), np.zeros((n, n))
-            for i, n0 in enumerate(dp_noise_levels):
-                for j, n1 in enumerate(dp_noise_levels):
-                    set_seed(seed)
-                    j0, j1 = run_fl_experiment(data_dir, [0, 1], 'dp', [n0, n1], base_conf, dp_clip, args, loss_fn, device, seed)
-                    grid_c0_dp[i, j] = norm_improvement(oracle0, local0, j0)
-                    grid_c1_dp[i, j] = norm_improvement(oracle1, local1, j1)
-            
-            accum[sname]["dp"][0].append(grid_c0_dp)
-            accum[sname]["dp"][1].append(grid_c1_dp)
-            grid_to_csv(grid_c0_dp, dp_noise_levels, "noise", sname, lbl0, seed, os.path.join(args.results, f"dp_{sname}.csv"))
-            grid_to_csv(grid_c1_dp, dp_noise_levels, "noise", sname, lbl1, seed, os.path.join(args.results, f"dp_{sname}.csv"))
+            # print("    DP grid ...")
+            # n = len(dp_noise_levels)
+            # grid_c0_dp, grid_c1_dp = np.zeros((n, n)), np.zeros((n, n))
+            # for i, n0 in enumerate(dp_noise_levels):
+            #     for j, n1 in enumerate(dp_noise_levels):
+            #         set_seed(seed)
+            #         j0, j1 = run_fl_experiment(data_dir, [0, 1], 'dp', [n0, n1], base_conf, dp_clip, args, loss_fn, device, seed)
+            #         grid_c0_dp[i, j] = norm_improvement(oracle0, local0, j0)
+            #         grid_c1_dp[i, j] = norm_improvement(oracle1, local1, j1)
+            # 
+            # accum[sname]["dp"][0].append(grid_c0_dp)
+            # accum[sname]["dp"][1].append(grid_c1_dp)
+            # grid_to_csv(grid_c0_dp, dp_noise_levels, "noise", sname, lbl0, seed, os.path.join(args.results, f"dp_{sname}.csv"))
+            # grid_to_csv(grid_c1_dp, dp_noise_levels, "noise", sname, lbl1, seed, os.path.join(args.results, f"dp_{sname}.csv"))
 
             # Suppression Grid
             print("    Suppression grid ...")
@@ -453,7 +453,8 @@ def run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip,
 
     # Plot 12 Heatmaps
     print(f"\n{'='*60}\n  Plotting 12 heatmaps ...")
-    method_meta = [("dp", dp_noise_levels, "DP Noise σ"), ("sup", sup_levels, "Suppression ratio")]
+    # method_meta = [("dp", dp_noise_levels, "DP Noise σ"), ("sup", sup_levels, "Suppression ratio")]
+    method_meta = [("sup", sup_levels, "Suppression ratio")]  # DP disabled
 
     for sname, (_, lbl0, lbl1) in scenarios.items():
         for method, param_grid, param_label in method_meta:

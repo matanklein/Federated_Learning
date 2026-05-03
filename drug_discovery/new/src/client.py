@@ -46,11 +46,9 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
     def fit(self, parameters, config):
         self.set_parameters(parameters)
         
+        # Re-initialize the optimizer. Do NOT load local momentum states for 
+        # parameters that have just been aggregated globally by the server.
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.conf.lr, weight_decay=self.conf.weight_decay)
-        
-        # FIX 1: Restore Adam Momentum
-        if os.path.exists(self.optim_path):
-            optimizer.load_state_dict(torch.load(self.optim_path, map_location=self.device))
             
         train_loader = torch.utils.data.DataLoader(
             self.train_dataset, batch_size=self.conf.batch_size, shuffle=True, collate_fn=sc.sparse_collate
@@ -58,43 +56,42 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
         
         self.model.train()
         
-        # FIX 2: Process exactly ONE BATCH to stop Client Drift and mirror old code
-        try:
-            batch = next(iter(train_loader))
-        except StopIteration:
-            return self.get_parameters(config={}), len(self.train_dataset), {}
+        # Iterate over the entire dataset (1 local epoch) to ensure gradient steps 
+        # strictly correlate with the privacy parameter 'p' (dataset size reduction).
+        for batch in train_loader:
+            b_x = torch.sparse_coo_tensor(
+                batch["x_ind"], batch["x_data"], size=[batch["batch_size"], self.conf.input_size]
+            ).to(self.device)
             
-        b_x = torch.sparse_coo_tensor(
-            batch["x_ind"], batch["x_data"], size=[batch["batch_size"], self.conf.input_size]
-        ).to(self.device)
-        
-        y_ind, y_data = batch["y_ind"].to(self.device), batch["y_data"].to(self.device)
-        
-        optimizer.zero_grad()
-        logits = self.model(b_x)
-        
-        logits_subset = logits[y_ind[0], y_ind[1]]
-        if logits_subset.numel() > 0:
-            loss = self.loss_fn(logits_subset, y_data).mean()
-            loss.backward()
+            y_ind, y_data = batch["y_ind"].to(self.device), batch["y_data"].to(self.device)
+            
+            optimizer.zero_grad()
+            logits = self.model(b_x)
+            
+            logits_subset = logits[y_ind[0], y_ind[1]]
+            if logits_subset.numel() > 0:
+                loss = self.loss_fn(logits_subset, y_data).mean()
+                loss.backward()
 
-            if self.privacy_mode == 'dp' and self.privacy_param > 0.0 and self.dp_clip is not None:
-                torch.nn.utils.clip_grad_norm_(self.model.trunk.parameters(), max_norm=self.dp_clip)
-                for p in self.model.trunk.parameters():
-                    if p.grad is not None:
-                        noise = torch.normal(mean=0.0, std=self.privacy_param * self.dp_clip, size=p.grad.shape).to(self.device)
-                        p.grad += noise
+                # DP Processing: Clip and add noise per batch
+                if self.privacy_mode == 'dp' and self.privacy_param > 0.0 and self.dp_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(self.model.trunk.parameters(), max_norm=self.dp_clip)
+                    for p in self.model.trunk.parameters():
+                        if p.grad is not None:
+                            noise = torch.normal(mean=0.0, std=self.privacy_param * self.dp_clip, size=p.grad.shape).to(self.device)
+                            p.grad += noise
 
-            optimizer.step()
+                optimizer.step()
 
-        # Save Optimizer and Head
-        torch.save(optimizer.state_dict(), self.optim_path)
+        # Save ONLY the personalized head state. 
         head_state = {k: v for k, v in self.model.state_dict().items() if 'trunk' not in k}
         torch.save(head_state, self.head_path)
 
         # Free memory to prevent Seed crashing
         torch.cuda.empty_cache()
 
+        # By returning len(self.train_dataset), Flower's FedAvg natively applies 
+        # a smaller aggregation weight to clients who suppressed data.
         return self.get_parameters(config={}), len(self.train_dataset), {}
 
     def evaluate(self, parameters, config):
