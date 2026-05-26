@@ -27,6 +27,7 @@ Quick run (full data, 3 seed, 3x3 grids, 50 rounds):
     --n_samples 50000 \
     --seed_range 3 \
     --rounds 50 \
+    --overlap 2808 \
     --data_root src/data_50k/ \
     --results src/results_50k/ \
     --plots src/plots_50k/ &
@@ -59,10 +60,10 @@ INPUT_SIZE  = 32000
 OUTPUT_SIZE = 2808
 OVERLAP     = 2808
 
-DP_NOISE_LEVELS_FULL  = [0.00, 0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00]
+DP_NOISE_LEVELS_FULL  = [0.00, 0.1, 0.2, 0.3, 0.4]
 DP_NOISE_LEVELS_QUICK = [0.00, 0.50, 2.00]
 
-SUP_LEVELS_FULL  = [round(0.1 * i, 1) for i in range(11)]
+SUP_LEVELS_FULL  = [0.0, 0.1, 0.2, 0.3, 0.4]
 SUP_LEVELS_QUICK = [0.0, 0.45, 0.90]
 
 DATA_PATH    = "../data/"
@@ -74,6 +75,7 @@ PLOTS_ROOT   = "plots/"
 def parse_args():
     p = argparse.ArgumentParser(description="DP + Suppression federated privacy experiment with Flower")
     p.add_argument("--seed_range", type=int, default=10, help="Number of seeds. Use 1-3 for a quick check.")
+    p.add_argument("--seed_start", type=int, default=0, help="First seed index to run.")
     p.add_argument("--rounds", type=int, default=200, help="FL training rounds per experiment. Use 50 for a quick check.")
     p.add_argument("--n_samples", type=int, default=None, help="Subsample N rows from training data. Omit to use all.")
     p.add_argument("--overlap", type=int, default=OVERLAP, help=f"Number of shared tasks between clients (default {OVERLAP}).")
@@ -83,6 +85,10 @@ def parse_args():
     p.add_argument("--results", type=str, default=RESULTS_ROOT, help="Directory for CSV result files.")
     p.add_argument("--plots", type=str, default=PLOTS_ROOT, help="Directory for heatmap PNG files.")
     p.add_argument("--clip_batches", type=int, default=20, help="Number of batches to use for auto clip estimation.")
+    p.add_argument("--client_cpus", type=int, default=max(1, (os.cpu_count() or 1) // 2), help="CPU cores reserved for each Flower client.")
+    p.add_argument("--client_gpus", type=float, default=1.0 if torch.cuda.is_available() else 0.0, help="GPUs reserved for each Flower client.")
+    p.add_argument("--dataloader_workers", type=int, default=max(0, min(4, (os.cpu_count() or 1) // 2)), help="Worker processes used by each client DataLoader.")
+    p.add_argument("--torch_threads", type=int, default=max(1, os.cpu_count() or 1), help="Torch intra-op threads used inside each process.")
     return p.parse_args()
 
 # --- Utility Functions ---
@@ -148,7 +154,7 @@ def make_base_conf(n_train_total, rounds):
     c.rounds = rounds
     return c
 
-def estimate_dp_clip(base_conf, data_dir, device, n_batches=20):
+def estimate_dp_clip(base_conf, data_dir, device, n_batches=20, share_all_layers=False):
     """Auto-estimates DP clip norm from the 75th percentile of actual gradient norms."""
     print("\nEstimating gradient norms for DP clip selection ...")
     X, Y = load_split_xy(data_dir, 0, "train")
@@ -168,28 +174,22 @@ def estimate_dp_clip(base_conf, data_dir, device, n_batches=20):
     for i, batch in enumerate(loader):
         if i >= n_batches: break
         
-        # Construct the PyTorch sparse tensor for the input
         b_x = torch.sparse_coo_tensor(
-            batch["x_ind"], 
-            batch["x_data"], 
-            size=[batch["batch_size"], c.input_size]
+            batch["x_ind"], batch["x_data"], size=[batch["batch_size"], c.input_size]
         ).to(device)
-        
         y_ind = batch["y_ind"].to(device)
         y_data = batch["y_data"].to(device)
 
         optimizer.zero_grad()
-        
-        # Pass the sparse tensor to the model
         logits = model(b_x)
-        
-        # Compute loss ONLY on the known sparse labels to save memory
         logits_subset = logits[y_ind[0], y_ind[1]]
         loss = loss_fn(logits_subset, y_data).mean()
         loss.backward()
 
         total_norm = 0.0
-        for p in model.trunk.parameters():
+        # Check sharing toggle to evaluate DP clip on the correct architecture bounds
+        target_params = model.parameters() if share_all_layers else model.trunk.parameters()
+        for p in target_params:
             if p.grad is not None:
                 total_norm += p.grad.data.norm(2).item() ** 2
         norms.append(total_norm ** 0.5)
@@ -246,61 +246,79 @@ def evaluate_global_model(model, test_dataset, conf, loss_fn, device):
                 
     return total_loss / max(samples, 1)
 
-def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, dp_clip, args, loss_fn, device, seed):
+def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers):
     """Executes a Flower simulation and returns final losses for the given clients."""
     path_suffix = os.path.join(data_dir, "data_2_split/")
     head_dir = args.results 
     
-    # Clean up old persistent heads before starting a fresh simulation
     for k in group:
         hp = os.path.join(head_dir, f"head_{k}.pt")
         op = os.path.join(head_dir, f"optim_{k}.pt")
         if os.path.exists(hp): os.remove(hp)
         if os.path.exists(op): os.remove(op)
 
-    # FIX 1: Pre-load datasets to ensure suppression consistency across rounds!
     set_seed(seed)
+    torch.set_num_threads(max(1, args.torch_threads))
+    if hasattr(torch, "set_num_interop_threads"):
+        try:
+            torch.set_num_interop_threads(max(1, min(args.torch_threads, max(1, args.torch_threads // 2))))
+        except RuntimeError:
+            pass
     client_datasets = {}
     for flower_id, k in enumerate(group):
         p_val = privacy_params[flower_id]
         client_datasets[k] = get_client_datasets(path_suffix, k, p_val, privacy_mode, base_conf)
 
-    # FIX 2: Ensure all clients start from the EXACT SAME initial weights as the Oracle
     set_seed(seed)
     initial_model = sc.TrunkAndHead(conf=base_conf, trunk=sc.Trunk(base_conf))
     
-    # Extract trunk parameters to give to the Flower Server
-    initial_trunk_params = fl.common.ndarrays_to_parameters(
-        [val.cpu().numpy() for _, val in initial_model.trunk.state_dict().items()]
-    )
-    # Extract head parameters to inject into clients
-    initial_head_state = {k: v for k, v in initial_model.state_dict().items() if 'trunk' not in k}
+    # NEW LOGIC: Pass either the entire model OR just the trunk to the server based on sharing setting
+    if share_all_layers:
+        initial_server_params = fl.common.ndarrays_to_parameters(
+            [val.cpu().numpy() for _, val in initial_model.state_dict().items()]
+        )
+    else:
+        initial_server_params = fl.common.ndarrays_to_parameters(
+            [val.cpu().numpy() for _, val in initial_model.trunk.state_dict().items()]
+        )
+        initial_head_state = {k: v for k, v in initial_model.state_dict().items() if 'trunk' not in k}
 
     def client_fn(cid: str) -> fl.client.Client:
             flower_id = int(cid) 
             k = group[flower_id]
             p_val = privacy_params[flower_id]
             
-            # Pull fixed dataset from closure
             train_ds, test_ds = client_datasets[k]
             
             trunk = sc.Trunk(base_conf)
             model = sc.TrunkAndHead(conf=base_conf, trunk=trunk)
             
-            # Force deterministic Head initialization on Round 1
-            hp = os.path.join(head_dir, f"head_{k}.pt")
-            if not os.path.exists(hp):
-                model.load_state_dict(initial_head_state, strict=False)
+            if not share_all_layers:
+                hp = os.path.join(head_dir, f"head_{k}.pt")
+                if not os.path.exists(hp):
+                    model.load_state_dict(initial_head_state, strict=False)
             
             return DrugDiscoveryClient(
-                model, train_ds, test_ds, base_conf, loss_fn, privacy_mode, p_val, dp_clip, k, head_dir
+                model,
+                train_ds,
+                test_ds,
+                base_conf,
+                loss_fn,
+                privacy_mode,
+                p_val,
+                dp_clip,
+                k,
+                head_dir,
+                share_all_layers,
+                num_workers=args.dataloader_workers,
+                pin_memory=device.type == "cuda",
             ).to_client()
 
     strategy = SaveModelStrategy(
         target_rounds=args.rounds,
         fraction_fit=1.0, fraction_evaluate=1.0,
         min_fit_clients=len(group), min_evaluate_clients=len(group), min_available_clients=len(group),
-        initial_parameters=initial_trunk_params  # FIX 3: Push deterministic trunk to server
+        initial_parameters=initial_server_params 
     )
 
     fl.simulation.start_simulation(
@@ -308,42 +326,47 @@ def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, 
         num_clients=len(group),
         config=fl.server.ServerConfig(num_rounds=args.rounds),
         strategy=strategy,
-        client_resources={"num_cpus": 1, "num_gpus": 0.0 if device.type == 'cpu' else 1.0},
+        client_resources={"num_cpus": max(1, args.client_cpus), "num_gpus": args.client_gpus if device.type == 'cuda' else 0.0},
     )
         
-    # Calculate performance using the global trunk + personalized local head
     final_losses = []
     for k in group:
         _, test_ds = get_client_datasets(path_suffix, k, 0.0, 'suppression', base_conf)
         trunk = sc.Trunk(base_conf)
         model = sc.TrunkAndHead(conf=base_conf, trunk=trunk)
         
-        hp = os.path.join(head_dir, f"head_{k}.pt")
-        if os.path.exists(hp):
-            model.load_state_dict(torch.load(hp), strict=False)
+        # Load local head if personalized
+        if not share_all_layers:
+            hp = os.path.join(head_dir, f"head_{k}.pt")
+            if os.path.exists(hp):
+                model.load_state_dict(torch.load(hp), strict=False)
             
+        # Download server weights to evaluate
         if strategy.final_parameters is not None:
-            params_dict = zip(model.trunk.state_dict().keys(), strategy.final_parameters)
-            state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-            model.trunk.load_state_dict(state_dict, strict=True)
+            if share_all_layers:
+                params_dict = zip(model.state_dict().keys(), strategy.final_parameters)
+                state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+                model.load_state_dict(state_dict, strict=True)
+            else:
+                params_dict = zip(model.trunk.state_dict().keys(), strategy.final_parameters)
+                state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+                model.trunk.load_state_dict(state_dict, strict=True)
             
         loss = evaluate_global_model(model, test_ds, base_conf, loss_fn, device)
         final_losses.append(loss)
-        
+
     return final_losses
 
-def run_local(client_idx, data_dir, base_conf, dp_clip, args, loss_fn, device, seed):
+def run_local(client_idx, data_dir, base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers):
     """Evaluates untouched (Oracle) model, then trains a local model via 1-client FL instance."""
     path_suffix = os.path.join(data_dir, "data_2_split/")
     _, test_ds = get_client_datasets(path_suffix, client_idx, 0.0, 'suppression', base_conf)
     
-    # Untrained model for Oracle
     set_seed(seed)
     untrained_model = sc.TrunkAndHead(conf=base_conf, trunk=sc.Trunk(base_conf))
     oracle_loss = evaluate_global_model(untrained_model, test_ds, base_conf, loss_fn, device)
     
-    # Standard local training wrapped in Flower engine (1 round equivalent local passes)
-    losses = run_fl_experiment(data_dir, [client_idx], 'suppression', [0.0], base_conf, dp_clip, args, loss_fn, device, seed)
+    losses = run_fl_experiment(data_dir, [client_idx], 'suppression', [0.0], base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers)
     return oracle_loss, losses[0]
 
 # --- Output Orchestration ---
@@ -376,21 +399,21 @@ def plot_heatmap(mean_grid, std_grid, param_grid, param_name, title, out_path):
     tick_labels = [f"{p:.2f}" if isinstance(p, float) else str(p) for p in param_grid]
     ax.set_xticks(range(len(param_grid)))
     ax.set_yticks(range(len(param_grid)))
-    ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=9)
-    ax.set_yticklabels(tick_labels, fontsize=9)
-    ax.set_xlabel(f"Client 1  {param_name}", fontsize=11)
-    ax.set_ylabel(f"Client 0  {param_name}", fontsize=11)
-    ax.set_title(title, fontsize=12, pad=12)
+    ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=13)
+    ax.set_yticklabels(tick_labels, fontsize=13)
+    ax.set_xlabel(f"Client 1  {param_name}", fontsize=16)
+    ax.set_ylabel(f"Client 0  {param_name}", fontsize=16)
+    ax.set_title(title, fontsize=16, pad=12)
 
     for i in range(len(param_grid)):
         for j in range(len(param_grid)):
             val = float(mean_grid[i, j])
             std = float(std_grid[i, j])
             color = "white" if abs(val) > abs_max * 0.6 else "black"
-            ax.text(j, i, f"{val:+.3f}\n±{std:.3f}", ha="center", va="center", fontsize=6.5, color=color)
+            ax.text(j, i, f"{val:+.3f}\n±{std:.3f}", ha="center", va="center", fontsize=9, color=color)
 
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Normalised Accuracy Improvement\n(theta − Theta) / |o − theta|", fontsize=10)
+    cbar.set_label("Normalised Accuracy Improvement\n(theta − Theta) / |o − theta|", fontsize=13)
 
     plt.tight_layout()
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -398,7 +421,7 @@ def plot_heatmap(mean_grid, std_grid, param_grid, param_name, title, out_path):
     plt.close()
     print(f"    Saved: {out_path}")
 
-def run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip, args, loss_fn, device):
+def run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip, args, loss_fn, device, share_all_layers):
     scenarios = {
         "real":   (splits["full"], "P1",  "P2"),
         "sim_p1": (splits["p1"],   "P11", "P12"),
@@ -413,9 +436,9 @@ def run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip,
         for sname, (data_dir, lbl0, lbl1) in scenarios.items():
             print(f"\n  [{sname}]  {lbl0} vs {lbl1}")
             set_seed(seed)
-            oracle0, local0 = run_local(0, data_dir, base_conf, dp_clip, args, loss_fn, device, seed)
+            oracle0, local0 = run_local(0, data_dir, base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers)
             set_seed(seed)
-            oracle1, local1 = run_local(1, data_dir, base_conf, dp_clip, args, loss_fn, device, seed)
+            oracle1, local1 = run_local(1, data_dir, base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers)
 
             print(f"      Baselines — c0: oracle={oracle0:.6f} local={local0:.6f} | c1: oracle={oracle1:.6f} local={local1:.6f}")
 
@@ -426,7 +449,7 @@ def run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip,
             for i, n0 in enumerate(dp_noise_levels):
                 for j, n1 in enumerate(dp_noise_levels):
                     set_seed(seed)
-                    j0, j1 = run_fl_experiment(data_dir, [0, 1], 'dp', [n0, n1], base_conf, dp_clip, args, loss_fn, device, seed)
+                    j0, j1 = run_fl_experiment(data_dir, [0, 1], 'dp', [n0, n1], base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers)
                     grid_c0_dp[i, j] = norm_improvement(oracle0, local0, j0)
                     grid_c1_dp[i, j] = norm_improvement(oracle1, local1, j1)
             
@@ -442,7 +465,7 @@ def run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip,
             for i, h0 in enumerate(sup_levels):
                 for j, h1 in enumerate(sup_levels):
                     set_seed(seed)
-                    j0, j1 = run_fl_experiment(data_dir, [0, 1], 'suppression', [h0, h1], base_conf, dp_clip, args, loss_fn, device, seed)
+                    j0, j1 = run_fl_experiment(data_dir, [0, 1], 'suppression', [h0, h1], base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers)
                     grid_c0_sup[i, j] = norm_improvement(oracle0, local0, j0)
                     grid_c1_sup[i, j] = norm_improvement(oracle1, local1, j1)
 
@@ -488,22 +511,42 @@ if __name__ == "__main__":
     for d in [args.data_root, args.results, os.path.join(args.plots, "dp"), os.path.join(args.plots, "sup")]:
         os.makedirs(d, exist_ok=True)
 
-    print("\nLoading data ...")
-    ecfp_tr, ic50_tr, ecfp_va, ic50_va = du.load_data(args.data_path)
-    ecfp_tr, ecfp_va = du.fold_input(ecfp_tr, INPUT_SIZE), du.fold_input(ecfp_va, INPUT_SIZE)
+    # Check if splits already exist
+    splits_exist = (
+        os.path.exists(os.path.join(args.data_root, "full", "data_2_split", "0_train")) and
+        os.path.exists(os.path.join(args.data_root, "p1", "data_2_split", "0_train")) and
+        os.path.exists(os.path.join(args.data_root, "p2", "data_2_split", "0_train"))
+    )
 
-    if args.n_samples is not None:
-        print(f"Subsampling to {args.n_samples:,} training rows ...")
-        ecfp_tr, ic50_tr = subsample(ecfp_tr, ic50_tr, n=args.n_samples, seed=0)
+    if splits_exist:
+        print("\nExisting splits detected at data_root. Skipping data loading and split creation.")
+        splits = {
+            "full": os.path.join(args.data_root, "full"),
+            "p1":   os.path.join(args.data_root, "p1"),
+            "p2":   os.path.join(args.data_root, "p2"),
+        }
+        # Load training data to determine n_train
+        x_tr, y_tr = load_split_xy(splits["full"], 0, "train")
+        n_train = x_tr.shape[0]
+        print(f"Training set : {n_train:,} samples | {x_tr.shape[1]:,} features | {y_tr.shape[1]:,} tasks")
+    else:
+        print("\nLoading data ...")
+        ecfp_tr, ic50_tr, ecfp_va, ic50_va = du.load_data(args.data_path)
+        ecfp_tr, ecfp_va = du.fold_input(ecfp_tr, INPUT_SIZE), du.fold_input(ecfp_va, INPUT_SIZE)
 
-    n_train = ecfp_tr.shape[0]
-    print(f"Training set : {n_train:,} samples | {ecfp_tr.shape[1]:,} features | {ic50_tr.shape[1]:,} tasks")
+        if args.n_samples is not None:
+            print(f"Subsampling to {args.n_samples:,} training rows ...")
+            ecfp_tr, ic50_tr = subsample(ecfp_tr, ic50_tr, n=args.n_samples, seed=0)
 
-    print("\nPreparing fixed data splits ...")
-    splits = prepare_fixed_splits(ecfp_tr, ic50_tr, overlap=args.overlap, root=args.data_root)
+        n_train = ecfp_tr.shape[0]
+        print(f"Training set : {n_train:,} samples | {ecfp_tr.shape[1]:,} features | {ic50_tr.shape[1]:,} tasks")
+
+        print("\nPreparing fixed data splits ...")
+        splits = prepare_fixed_splits(ecfp_tr, ic50_tr, overlap=args.overlap, root=args.data_root)
 
     base_conf = make_base_conf(n_train, rounds=args.rounds)
-    dp_clip = estimate_dp_clip(base_conf, data_dir=splits["full"], device=device, n_batches=args.clip_batches)
+    share_all_layers = (args.overlap == OUTPUT_SIZE)
+    dp_clip = estimate_dp_clip(base_conf, data_dir=splits["full"], device=device, n_batches=args.clip_batches, share_all_layers=share_all_layers)
 
     dp_cells, sup_cells = len(dp_noise_levels)**2, len(sup_levels)**2
     total_runs = args.seed_range * 3 * (dp_cells + sup_cells + 4)
@@ -513,4 +556,5 @@ if __name__ == "__main__":
     print(f"  SUP grid     : {len(sup_levels)}×{len(sup_levels)} = {sup_cells} cells")
     print(f"  Total Flower FL runs : ~{total_runs:,}")
 
-    run_all(splits, base_conf, range(args.seed_range), dp_noise_levels, sup_levels, dp_clip, args, loss_fn, device)
+    seed_range = range(args.seed_start, args.seed_start + args.seed_range)
+    run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip, args, loss_fn, device, share_all_layers)

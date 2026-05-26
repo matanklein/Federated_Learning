@@ -120,10 +120,9 @@ class SparseInputNet(torch.nn.Module):
         if self.input_splits[1] == 0:
             self.net_rare = None
         else:
-            ## TODO: try adding nn.ReLU() after SparseLinear
-            ## Bias is not needed as net_freq provides it
             self.net_rare = nn.Sequential(
                 SparseLinear(self.input_splits[1], conf.tail_hidden_size),
+                nn.ReLU(),
                 nn.Linear(conf.tail_hidden_size, conf.hidden_sizes[0], bias=False),
             )
 
@@ -247,5 +246,4 @@ class TrunkAndHead(torch.nn.Module):
         X = self.trunk(X)
         return self.head(X)
         
-
 

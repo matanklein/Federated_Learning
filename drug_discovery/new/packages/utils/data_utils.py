@@ -28,8 +28,8 @@ def load_data(rel_path, folding_split=True, train_ratio=0.8):
     scipy.sparse.csr_matrix
         A sparse matrix containing the validation data labels.
     """
-    ecfp    = scipy.io.mmread(rel_path + "chembl_23_x.mtx").tocsr()
-    ic50    = scipy.io.mmread(rel_path + "chembl_23_y.mtx").tocsr()
+    ecfp    = scipy.io.mmread(rel_path + "X_data.mtx").tocsr()
+    ic50    = scipy.io.mmread(rel_path + "Y_data.mtx").tocsr()
 
     if folding_split:
         folding = np.load(rel_path + "folding_hier_0.6.npy")

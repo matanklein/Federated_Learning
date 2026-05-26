@@ -5,7 +5,7 @@ import numpy as np
 import packages.utils.data_utils as du
 
 
-def split_with_overlap(ratio, ecfp_tr, ic50_tr, root_dir="", overlap=1000):
+def split_with_overlap(ratio, ecfp_tr, ic50_tr, root_dir="", overlap=2808):
     """
     Split data into two clients with balanced task coverage and label density.
     Ensures equal number of active tasks per client and saves train/test splits.
