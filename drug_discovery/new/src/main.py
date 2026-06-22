@@ -1,560 +1,364 @@
-"""
-real fed(all data split into P1 + P2):
-  - P1's view:  norm_improvement(P1+P2) vs P1 local
-  - P2's view:  norm_improvement(P1+P2) vs P2 local
-
-P1 self-division simulation (P1 split into P11 + P12):
-  - P11's view: norm_improvement(P11+P12) vs P11 local
-  - P12's view: norm_improvement(P11+P12) vs P12 local
-
-P2 self-division simulation (P2 split into P21 + P22):
-  - P21's view: norm_improvement(P21+P22) vs P21 local
-  - P22's view: norm_improvement(P21+P22) vs P22 local
-
-Normalized improvement = (theta - Theta) / |o - theta|
-  where o     = oracle loss (initial before any training)
-        theta = local training loss
-        Theta = federated training loss
-
-Each of the 6 pairs produced TWICE: once for Suppression, once for DP.
-= 12 heatmaps total.
-
-Note: run from project directory.
-
-Quick run (full data, 3 seed, 3x3 grids, 50 rounds):
-    nohup env PYTHONPATH=. python src/main.py \
-    --data_path ./data/ \
-    --n_samples 50000 \
-    --seed_range 3 \
-    --rounds 50 \
-    --overlap 2808 \
-    --data_root src/data_50k/ \
-    --results src/results_50k/ \
-    --plots src/plots_50k/ &
-
-Full run:
-    PYTHONPATH=/home/pejo_balazs/COL-Drug/mina python src/main.py --seed_range 10 --rounds 200
-"""
-
-import argparse
 import os
+import sys
+import argparse
 import csv
-import copy
+import time
+import datetime
 import numpy as np
 import torch
-from collections import OrderedDict
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 import flwr as fl
+import flwr.common as flc
+from flwr.server.strategy import FedAvg
+import seaborn as sns
+import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm, LinearSegmentedColormap
+import pandas as pd
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import gc
+
+# Inject local paths
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path: sys.path.insert(0, PROJECT_ROOT)
+
 import sparsechem as sc
-import packages.utils.data_utils as du
-from split_data import split_with_overlap
+from client import DrugDiscoveryClient, get_parameters, set_parameters
 from dataset import get_client_datasets
-from client import DrugDiscoveryClient
 
-# --- Configuration Constants ---
-INPUT_SIZE  = 32000
-OUTPUT_SIZE = 2808
-OVERLAP     = 2808
+# ==========================================
+# EXPERIMENT CONFIGURATION
+# ==========================================
+MECHANISMS = ["sup", "dp"]
+SCENARIOS = ["full", "p1", "p2"]
 
-DP_NOISE_LEVELS_FULL  = [0.00, 0.1, 0.2, 0.3, 0.4]
-DP_NOISE_LEVELS_QUICK = [0.00, 0.50, 2.00]
+PRIVACY_PARAMS_BY_MECH = {
+    "dp": [0.0, 0.001, 0.01, 0.1, 1.0],
+    "sup": [0.0, 0.2, 0.4, 0.6, 0.8],
+}
 
-SUP_LEVELS_FULL  = [0.0, 0.1, 0.2, 0.3, 0.4]
-SUP_LEVELS_QUICK = [0.0, 0.45, 0.90]
+# Name mapping for clean outputs
+SCENARIO_MAP = {
+    "full": "real",
+    "p1": "sim_p1",
+    "p2": "sim_p2"
+}
 
-DATA_PATH    = "../data/"
-DATA_ROOT    = "experiment_data/"
-RESULTS_ROOT = "results/"
-PLOTS_ROOT   = "plots/"
+CLIENT_MAP = {
+    "full": {0: "P1", 1: "P2"},
+    "p1": {0: "P11", 1: "P12"},
+    "p2": {0: "P21", 1: "P22"}
+}
 
-# --- Argument Parsing ---
-def parse_args():
-    p = argparse.ArgumentParser(description="DP + Suppression federated privacy experiment with Flower")
-    p.add_argument("--seed_range", type=int, default=10, help="Number of seeds. Use 1-3 for a quick check.")
-    p.add_argument("--seed_start", type=int, default=0, help="First seed index to run.")
-    p.add_argument("--rounds", type=int, default=200, help="FL training rounds per experiment. Use 50 for a quick check.")
-    p.add_argument("--n_samples", type=int, default=None, help="Subsample N rows from training data. Omit to use all.")
-    p.add_argument("--overlap", type=int, default=OVERLAP, help=f"Number of shared tasks between clients (default {OVERLAP}).")
-    p.add_argument("--quick", action="store_true", help="Use reduced 3x3 parameter grids (~1-2 hours).")
-    p.add_argument("--data_path", type=str, default=DATA_PATH, help="Path to raw data directory.")
-    p.add_argument("--data_root", type=str, default=DATA_ROOT, help="Root directory for persisted splits.")
-    p.add_argument("--results", type=str, default=RESULTS_ROOT, help="Directory for CSV result files.")
-    p.add_argument("--plots", type=str, default=PLOTS_ROOT, help="Directory for heatmap PNG files.")
-    p.add_argument("--clip_batches", type=int, default=20, help="Number of batches to use for auto clip estimation.")
-    p.add_argument("--client_cpus", type=int, default=max(1, (os.cpu_count() or 1) // 2), help="CPU cores reserved for each Flower client.")
-    p.add_argument("--client_gpus", type=float, default=1.0 if torch.cuda.is_available() else 0.0, help="GPUs reserved for each Flower client.")
-    p.add_argument("--dataloader_workers", type=int, default=max(0, min(4, (os.cpu_count() or 1) // 2)), help="Worker processes used by each client DataLoader.")
-    p.add_argument("--torch_threads", type=int, default=max(1, os.cpu_count() or 1), help="Torch intra-op threads used inside each process.")
-    return p.parse_args()
+class DummyClientProxy(fl.server.client_proxy.ClientProxy):
+    def __init__(self, cid):
+        try:
+            super().__init__(cid)
+        except Exception:
+            self.cid = cid
+    def get_properties(self, ins, timeout, group_id=0): pass
+    def get_parameters(self, ins, timeout, group_id=0): pass
+    def fit(self, ins, timeout, group_id=0): pass
+    def evaluate(self, ins, timeout, group_id=0): pass
+    def reconnect(self, ins, timeout, group_id=0): pass
 
-# --- Utility Functions ---
-def set_seed(seed):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-def subsample(ecfp, ic50, n, seed=0):
-    rng = np.random.RandomState(seed)
-    idx = np.sort(rng.choice(ecfp.shape[0], size=n, replace=False))
-    return ecfp[idx], ic50[idx]
-
-def load_split_xy(split_dir, client_idx, subset):
-    path = os.path.join(split_dir, "data_2_split") + "/"
-    return du.load_ratio_split_data(path, client_idx, train=(subset == "train"))
-
-def prepare_fixed_splits(ecfp_tr, ic50_tr, overlap, root):
-    """Creates the three fixed two-client splits for Real, Sim_P1, and Sim_P2."""
-    paths = {
-        "full": os.path.join(root, "full"),
-        "p1":   os.path.join(root, "p1"),
-        "p2":   os.path.join(root, "p2"),
-    }
-
-    marker_full = os.path.join(paths["full"], "data_2_split", "0_train")
-    if not os.path.exists(marker_full):
-        print("  Creating P1/P2 split ...")
-        set_seed(0)
-        split_with_overlap(1, ecfp_tr, ic50_tr, root_dir=paths["full"], overlap=overlap)
-    else:
-        print("  P1/P2 split already exists, skipping.")
-
-    x_p1_tr, y_p1_tr = load_split_xy(paths["full"], 0, "train")
-    x_p2_tr, y_p2_tr = load_split_xy(paths["full"], 1, "train")
-
-    marker_p1 = os.path.join(paths["p1"], "data_2_split", "0_train")
-    if not os.path.exists(marker_p1):
-        print("  Creating P11/P12 split ...")
-        set_seed(0)
-        split_with_overlap(1, x_p1_tr, y_p1_tr, root_dir=paths["p1"], overlap=overlap)
-
-    marker_p2 = os.path.join(paths["p2"], "data_2_split", "0_train")
-    if not os.path.exists(marker_p2):
-        print("  Creating P21/P22 split ...")
-        set_seed(0)
-        split_with_overlap(1, x_p2_tr, y_p2_tr, root_dir=paths["p2"], overlap=overlap)
-
-    return paths
-
-def make_base_conf(n_train_total, rounds):
-    batch_size = max(64, int((n_train_total / 2) * 0.02))
+def make_base_conf():
     c = sc.ModelConfig(
-        input_size         = INPUT_SIZE,
-        hidden_sizes       = [40],
-        output_size        = OUTPUT_SIZE,
-        batch_size         = batch_size,
-        lr                 = 1e-3,
-        last_dropout       = 0.2,
-        weight_decay       = 1e-5,
-        non_linearity      = "relu",
-        last_non_linearity = "relu",
+        input_size=32000,
+        hidden_sizes=[40], # Optimal capacity
+        output_size=2808,
+        batch_size=64,
+        lr=1e-3,
+        last_dropout=0.2,
+        weight_decay=1e-5,
+        non_linearity="relu",
+        last_non_linearity="relu",
     )
-    c.rounds = rounds
+    c.epochs = 5 # Local epochs per FL round
     return c
 
-def estimate_dp_clip(base_conf, data_dir, device, n_batches=20, share_all_layers=False):
-    """Auto-estimates DP clip norm from the 75th percentile of actual gradient norms."""
-    print("\nEstimating gradient norms for DP clip selection ...")
-    X, Y = load_split_xy(data_dir, 0, "train")
-    dataset = sc.SparseDataset(X, Y)
-
-    c = copy.deepcopy(base_conf)
-    c.output_size = Y.shape[1]
-    c.batch_size = max(64, int(X.shape[0] * 0.02))
-
-    model = sc.TrunkAndHead(conf=c, trunk=sc.Trunk(c)).to(device)
+def train_and_eval_local_baseline(data_path, client_id, seed, rounds):
+    """Establishes Oracle and Alone baselines."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    conf = make_base_conf()
+    train_ds, test_ds = get_client_datasets(data_path, client_id, 0.0, 'none', conf, seed)
+    
+    model = sc.TrunkAndHead(conf=conf, trunk=sc.Trunk(conf)).to(device)
     loss_fn = torch.nn.BCEWithLogitsLoss(reduction="none")
-    optimizer = torch.optim.Adam(model.parameters(), lr=c.lr, weight_decay=c.weight_decay)
-    loader = torch.utils.data.DataLoader(dataset, batch_size=c.batch_size, shuffle=True, collate_fn=sc.sparse_collate)
-
-    norms = []
-    model.train()
-    for i, batch in enumerate(loader):
-        if i >= n_batches: break
-        
-        b_x = torch.sparse_coo_tensor(
-            batch["x_ind"], batch["x_data"], size=[batch["batch_size"], c.input_size]
-        ).to(device)
-        y_ind = batch["y_ind"].to(device)
-        y_data = batch["y_data"].to(device)
-
-        optimizer.zero_grad()
-        logits = model(b_x)
-        logits_subset = logits[y_ind[0], y_ind[1]]
-        loss = loss_fn(logits_subset, y_data).mean()
-        loss.backward()
-
-        total_norm = 0.0
-        # Check sharing toggle to evaluate DP clip on the correct architecture bounds
-        target_params = model.parameters() if share_all_layers else model.trunk.parameters()
-        for p in target_params:
-            if p.grad is not None:
-                total_norm += p.grad.data.norm(2).item() ** 2
-        norms.append(total_norm ** 0.5)
-
-    norms = np.array(norms)
-    clip = float(np.percentile(norms, 75))
-    print(f"  Gradient norms over {n_batches} batches:")
-    print(f"    p75    = {clip:.6f}   ← selected as dp_clip")
-    return clip
-
-def norm_improvement(oracle, local, federated, eps=1e-8):
-    return (local - federated) / (abs(oracle - local) + eps)
-
-# --- Flower FL Execution Engine ---
-class SaveModelStrategy(fl.server.strategy.FedAvg):
-    def __init__(self, target_rounds, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.final_parameters = None
-        self.target_rounds = target_rounds
-
-    def aggregate_fit(self, server_round, results, failures):
-        aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
-        if aggregated_parameters is not None and server_round == self.target_rounds:
-            self.final_parameters = fl.common.parameters_to_ndarrays(aggregated_parameters)
-        return aggregated_parameters, aggregated_metrics
-
-def evaluate_global_model(model, test_dataset, conf, loss_fn, device):
-    """Calculates evaluation loss. The model retains its personalized Head while evaluating."""
-    model.to(device)
-    model.eval()
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=conf.batch_size, collate_fn=sc.sparse_collate)
     
-    total_loss, samples = 0.0, 0
-    with torch.no_grad():
-        for batch in test_loader:
-            # Construct the PyTorch sparse tensor
-            b_x = torch.sparse_coo_tensor(
-                batch["x_ind"], 
-                batch["x_data"], 
-                size=[batch["batch_size"], conf.input_size]
-            ).to(device)
-            
-            y_ind = batch["y_ind"].to(device)
-            y_data = batch["y_data"].to(device)
-            
-            logits = model(b_x)
-            
-            # Extract only the active target predictions
-            logits_subset = logits[y_ind[0], y_ind[1]]
-            if logits_subset.numel() > 0:
-                loss = loss_fn(logits_subset, y_data)
-                total_loss += loss.sum().item()
-                samples += logits_subset.numel()
-                
-    return total_loss / max(samples, 1)
-
-def run_fl_experiment(data_dir, group, privacy_mode, privacy_params, base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers):
-    """Executes a Flower simulation and returns final losses for the given clients."""
-    path_suffix = os.path.join(data_dir, "data_2_split/")
-    head_dir = args.results 
+    dummy_client = DrugDiscoveryClient(model, train_ds, test_ds, conf, loss_fn, 'none', 0.0, 1.0, client_id, True)
+    _, _, oracle_metrics = dummy_client.evaluate(get_parameters(model), {})
     
-    for k in group:
-        hp = os.path.join(head_dir, f"head_{k}.pt")
-        op = os.path.join(head_dir, f"optim_{k}.pt")
-        if os.path.exists(hp): os.remove(hp)
-        if os.path.exists(op): os.remove(op)
-
-    set_seed(seed)
-    torch.set_num_threads(max(1, args.torch_threads))
-    if hasattr(torch, "set_num_interop_threads"):
-        try:
-            torch.set_num_interop_threads(max(1, min(args.torch_threads, max(1, args.torch_threads // 2))))
-        except RuntimeError:
-            pass
-    client_datasets = {}
-    for flower_id, k in enumerate(group):
-        p_val = privacy_params[flower_id]
-        client_datasets[k] = get_client_datasets(path_suffix, k, p_val, privacy_mode, base_conf)
-
-    set_seed(seed)
-    initial_model = sc.TrunkAndHead(conf=base_conf, trunk=sc.Trunk(base_conf))
+    # Simulate equivalent standalone training (rounds * local_epochs)
+    conf.epochs = rounds * 5 
+    dummy_client.fit(get_parameters(model), {})
+    _, _, alone_metrics = dummy_client.evaluate(get_parameters(dummy_client.model), {})
     
-    # NEW LOGIC: Pass either the entire model OR just the trunk to the server based on sharing setting
-    if share_all_layers:
-        initial_server_params = fl.common.ndarrays_to_parameters(
-            [val.cpu().numpy() for _, val in initial_model.state_dict().items()]
-        )
-    else:
-        initial_server_params = fl.common.ndarrays_to_parameters(
-            [val.cpu().numpy() for _, val in initial_model.trunk.state_dict().items()]
-        )
-        initial_head_state = {k: v for k, v in initial_model.state_dict().items() if 'trunk' not in k}
+    del model, dummy_client
+    gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-    def client_fn(cid: str) -> fl.client.Client:
-            flower_id = int(cid) 
-            k = group[flower_id]
-            p_val = privacy_params[flower_id]
-            
-            train_ds, test_ds = client_datasets[k]
-            
-            trunk = sc.Trunk(base_conf)
-            model = sc.TrunkAndHead(conf=base_conf, trunk=trunk)
-            
-            if not share_all_layers:
-                hp = os.path.join(head_dir, f"head_{k}.pt")
-                if not os.path.exists(hp):
-                    model.load_state_dict(initial_head_state, strict=False)
-            
-            return DrugDiscoveryClient(
-                model,
-                train_ds,
-                test_ds,
-                base_conf,
-                loss_fn,
-                privacy_mode,
-                p_val,
-                dp_clip,
-                k,
-                head_dir,
-                share_all_layers,
-                num_workers=args.dataloader_workers,
-                pin_memory=device.type == "cuda",
-            ).to_client()
-
-    strategy = SaveModelStrategy(
-        target_rounds=args.rounds,
-        fraction_fit=1.0, fraction_evaluate=1.0,
-        min_fit_clients=len(group), min_evaluate_clients=len(group), min_available_clients=len(group),
-        initial_parameters=initial_server_params 
-    )
-
-    fl.simulation.start_simulation(
-        client_fn=client_fn,
-        num_clients=len(group),
-        config=fl.server.ServerConfig(num_rounds=args.rounds),
-        strategy=strategy,
-        client_resources={"num_cpus": max(1, args.client_cpus), "num_gpus": args.client_gpus if device.type == 'cuda' else 0.0},
-    )
-        
-    final_losses = []
-    for k in group:
-        _, test_ds = get_client_datasets(path_suffix, k, 0.0, 'suppression', base_conf)
-        trunk = sc.Trunk(base_conf)
-        model = sc.TrunkAndHead(conf=base_conf, trunk=trunk)
-        
-        # Load local head if personalized
-        if not share_all_layers:
-            hp = os.path.join(head_dir, f"head_{k}.pt")
-            if os.path.exists(hp):
-                model.load_state_dict(torch.load(hp), strict=False)
-            
-        # Download server weights to evaluate
-        if strategy.final_parameters is not None:
-            if share_all_layers:
-                params_dict = zip(model.state_dict().keys(), strategy.final_parameters)
-                state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-                model.load_state_dict(state_dict, strict=True)
-            else:
-                params_dict = zip(model.trunk.state_dict().keys(), strategy.final_parameters)
-                state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-                model.trunk.load_state_dict(state_dict, strict=True)
-            
-        loss = evaluate_global_model(model, test_ds, base_conf, loss_fn, device)
-        final_losses.append(loss)
-
-    return final_losses
-
-def run_local(client_idx, data_dir, base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers):
-    """Evaluates untouched (Oracle) model, then trains a local model via 1-client FL instance."""
-    path_suffix = os.path.join(data_dir, "data_2_split/")
-    _, test_ds = get_client_datasets(path_suffix, client_idx, 0.0, 'suppression', base_conf)
-    
-    set_seed(seed)
-    untrained_model = sc.TrunkAndHead(conf=base_conf, trunk=sc.Trunk(base_conf))
-    oracle_loss = evaluate_global_model(untrained_model, test_ds, base_conf, loss_fn, device)
-    
-    losses = run_fl_experiment(data_dir, [client_idx], 'suppression', [0.0], base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers)
-    return oracle_loss, losses[0]
-
-# --- Output Orchestration ---
-def grid_to_csv(grid, param_grid, param_name, scenario, client_label, seed, path):
-    rows = []
-    for i, p0 in enumerate(param_grid):
-        for j, p1 in enumerate(param_grid):
-            rows.append({
-                "scenario":         scenario,
-                "client":           client_label,
-                "seed":             seed,
-                "param_name":       param_name,
-                f"{param_name}_c0": p0,
-                f"{param_name}_c1": p1,
-                "norm_improvement": float(grid[i, j]),
-            })
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    write_header = not os.path.exists(path) or os.path.getsize(path) == 0
-    with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        if write_header:
-            writer.writeheader()
-        writer.writerows(rows)
-
-def plot_heatmap(mean_grid, std_grid, param_grid, param_name, title, out_path):
-    fig, ax = plt.subplots(figsize=(10, 8))
-    abs_max = max(float(np.abs(mean_grid).max()), 1e-6)
-    im = ax.imshow(mean_grid, cmap="RdYlGn", vmin=-abs_max, vmax=abs_max, aspect="auto", origin="upper")
-
-    tick_labels = [f"{p:.2f}" if isinstance(p, float) else str(p) for p in param_grid]
-    ax.set_xticks(range(len(param_grid)))
-    ax.set_yticks(range(len(param_grid)))
-    ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=13)
-    ax.set_yticklabels(tick_labels, fontsize=13)
-    ax.set_xlabel(f"Client 1  {param_name}", fontsize=16)
-    ax.set_ylabel(f"Client 0  {param_name}", fontsize=16)
-    ax.set_title(title, fontsize=16, pad=12)
-
-    for i in range(len(param_grid)):
-        for j in range(len(param_grid)):
-            val = float(mean_grid[i, j])
-            std = float(std_grid[i, j])
-            color = "white" if abs(val) > abs_max * 0.6 else "black"
-            ax.text(j, i, f"{val:+.3f}\n±{std:.3f}", ha="center", va="center", fontsize=9, color=color)
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Normalised Accuracy Improvement\n(theta − Theta) / |o − theta|", fontsize=13)
-
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"    Saved: {out_path}")
-
-def run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip, args, loss_fn, device, share_all_layers):
-    scenarios = {
-        "real":   (splits["full"], "P1",  "P2"),
-        "sim_p1": (splits["p1"],   "P11", "P12"),
-        "sim_p2": (splits["p2"],   "P21", "P22"),
+    return {
+        "oracle_acc": oracle_metrics["accuracy"],
+        "oracle_loss": oracle_metrics["loss"],
+        "alone_acc": alone_metrics["accuracy"],
+        "alone_loss": alone_metrics["loss"]
     }
 
-    accum = {sname: {"dp": [[], []], "sup": [[], []]} for sname in scenarios}
-
-    for seed in seed_range:
-        print(f"\n{'='*60}  SEED {seed}  {'='*60}")
-        
-        for sname, (data_dir, lbl0, lbl1) in scenarios.items():
-            print(f"\n  [{sname}]  {lbl0} vs {lbl1}")
-            set_seed(seed)
-            oracle0, local0 = run_local(0, data_dir, base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers)
-            set_seed(seed)
-            oracle1, local1 = run_local(1, data_dir, base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers)
-
-            print(f"      Baselines — c0: oracle={oracle0:.6f} local={local0:.6f} | c1: oracle={oracle1:.6f} local={local1:.6f}")
-
-            # DP Grid
-            print("    DP grid ...")
-            n = len(dp_noise_levels)
-            grid_c0_dp, grid_c1_dp = np.zeros((n, n)), np.zeros((n, n))
-            for i, n0 in enumerate(dp_noise_levels):
-                for j, n1 in enumerate(dp_noise_levels):
-                    set_seed(seed)
-                    j0, j1 = run_fl_experiment(data_dir, [0, 1], 'dp', [n0, n1], base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers)
-                    grid_c0_dp[i, j] = norm_improvement(oracle0, local0, j0)
-                    grid_c1_dp[i, j] = norm_improvement(oracle1, local1, j1)
-            
-            accum[sname]["dp"][0].append(grid_c0_dp)
-            accum[sname]["dp"][1].append(grid_c1_dp)
-            grid_to_csv(grid_c0_dp, dp_noise_levels, "noise", sname, lbl0, seed, os.path.join(args.results, f"dp_{sname}.csv"))
-            grid_to_csv(grid_c1_dp, dp_noise_levels, "noise", sname, lbl1, seed, os.path.join(args.results, f"dp_{sname}.csv"))
-
-            # Suppression Grid
-            print("    Suppression grid ...")
-            m = len(sup_levels)
-            grid_c0_sup, grid_c1_sup = np.zeros((m, m)), np.zeros((m, m))
-            for i, h0 in enumerate(sup_levels):
-                for j, h1 in enumerate(sup_levels):
-                    set_seed(seed)
-                    j0, j1 = run_fl_experiment(data_dir, [0, 1], 'suppression', [h0, h1], base_conf, dp_clip, args, loss_fn, device, seed, share_all_layers)
-                    grid_c0_sup[i, j] = norm_improvement(oracle0, local0, j0)
-                    grid_c1_sup[i, j] = norm_improvement(oracle1, local1, j1)
-
-            accum[sname]["sup"][0].append(grid_c0_sup)
-            accum[sname]["sup"][1].append(grid_c1_sup)
-            grid_to_csv(grid_c0_sup, sup_levels, "suppression", sname, lbl0, seed, os.path.join(args.results, f"sup_{sname}.csv"))
-            grid_to_csv(grid_c1_sup, sup_levels, "suppression", sname, lbl1, seed, os.path.join(args.results, f"sup_{sname}.csv"))
-
-    # Plot 12 Heatmaps
-    print(f"\n{'='*60}\n  Plotting 12 heatmaps ...")
-    method_meta = [("dp", dp_noise_levels, "DP Noise σ"), ("sup", sup_levels, "Suppression ratio")]
-
-    for sname, (_, lbl0, lbl1) in scenarios.items():
-        for method, param_grid, param_label in method_meta:
-            for c_idx, lbl in enumerate([lbl0, lbl1]):
-                stack = np.stack(accum[sname][method][c_idx], axis=0)
-                mean_grid = stack.mean(axis=0)
-                std_grid = stack.std(axis=0)
-
-                n_seeds = len(list(seed_range))
-                title = (f"{lbl}'s View  ·  {method.upper()}  ·  {sname.upper()}\n"
-                         f"Norm. Improvement = (theta − Theta) / |o − theta|\n"
-                         f"mean ± std  over {n_seeds} seed{'s' if n_seeds > 1 else ''}")
-                
-                plot_heatmap(mean_grid, std_grid, param_grid, param_label, title, 
-                             out_path=os.path.join(args.plots, method, f"{sname}_{lbl}_{method}.png"))
-    print("\nAll 12 heatmaps saved.")
-
-# --- Main Entry Point ---
-if __name__ == "__main__":
-    args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    loss_fn = torch.nn.BCEWithLogitsLoss(reduction="none")
-
-    use_quick = args.quick or (args.n_samples is not None)
-    dp_noise_levels = DP_NOISE_LEVELS_QUICK if use_quick else DP_NOISE_LEVELS_FULL
-    sup_levels = SUP_LEVELS_QUICK if use_quick else SUP_LEVELS_FULL
+def worker_task(kwargs):
+    """Isolated worker process for FL Grid execution."""
+    # EXTREMELY IMPORTANT FOR MULTIPROCESSING RUNTIME: 
+    # Prevent PyTorch from spawning hundreds of background threads that gridlock the CPU
+    torch.set_num_threads(1)
     
-    print(f"Grid mode : {'QUICK (3x3)' if use_quick else 'FULL (9x9 / 11x11)'}")
-    print(f"DP  grid  : {dp_noise_levels}")
-    print(f"SUP grid  : {sup_levels}")
+    seed = kwargs["seed"]
+    scenario = kwargs["scenario"]
+    mech = kwargs["mech"]
+    p1_val = kwargs["p1_val"]
+    p2_val = kwargs["p2_val"]
+    data_path = kwargs["data_path"]
+    args = kwargs["args"]
+    baselines = kwargs["baselines"]
+    
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    conf = make_base_conf()
+    loss_fn = torch.nn.BCEWithLogitsLoss(reduction="none")
+    
+    t1, te1 = get_client_datasets(data_path, 0, p1_val, mech, conf, seed)
+    t2, te2 = get_client_datasets(data_path, 1, p2_val, mech, conf, seed)
+    
+    model1 = sc.TrunkAndHead(conf=conf, trunk=sc.Trunk(conf))
+    model2 = sc.TrunkAndHead(conf=conf, trunk=sc.Trunk(conf))
+    
+    c1 = DrugDiscoveryClient(model1, t1, te1, conf, loss_fn, mech, p1_val, 1.0, "0", True)
+    c2 = DrugDiscoveryClient(model2, t2, te2, conf, loss_fn, mech, p2_val, 1.0, "1", True)
+    
+    global_weights = get_parameters(model1)
+    strategy = FedAvg(fraction_fit=1.0, fraction_evaluate=1.0, min_fit_clients=2, min_evaluate_clients=2, min_available_clients=2)
+    
+    proxy1, proxy2 = DummyClientProxy("0"), DummyClientProxy("1")
+    
+    for rnd in range(1, args.rounds + 1):
+        c1.set_parameters(global_weights)
+        c2.set_parameters(global_weights)
+        
+        w1, num1, _ = c1.fit(global_weights, {})
+        w2, num2, _ = c2.fit(global_weights, {})
+        
+        if hasattr(flc, "Status"):
+            res1 = flc.FitRes(status=flc.Status(code=flc.Code.OK, message=""), parameters=flc.ndarrays_to_parameters(w1), num_examples=num1, metrics={})
+            res2 = flc.FitRes(status=flc.Status(code=flc.Code.OK, message=""), parameters=flc.ndarrays_to_parameters(w2), num_examples=num2, metrics={})
+        else:
+            res1, res2 = flc.FitRes(parameters=flc.ndarrays_to_parameters(w1), num_examples=num1, metrics={}), flc.FitRes(parameters=flc.ndarrays_to_parameters(w2), num_examples=num2, metrics={})
+            
+        agg_params, _ = strategy.aggregate_fit(server_round=rnd, results=[(proxy1, res1), (proxy2, res2)], failures=[])
+        if agg_params is not None:
+            global_weights = flc.parameters_to_ndarrays(agg_params)
 
-    for d in [args.data_root, args.results, os.path.join(args.plots, "dp"), os.path.join(args.plots, "sup")]:
-        os.makedirs(d, exist_ok=True)
+    _, _, fed_metrics_1 = c1.evaluate(global_weights, {})
+    _, _, fed_metrics_2 = c2.evaluate(global_weights, {})
+    
+    records = []
+    for c_id, fed_metrics in zip([0, 1], [fed_metrics_1, fed_metrics_2]):
+        b = baselines[c_id]
+        
+        acc_denom = abs(b["oracle_acc"] - b["alone_acc"])
+        gain_acc = (fed_metrics["accuracy"] - b["alone_acc"]) / acc_denom if acc_denom != 0 else 0.0
+        
+        loss_denom = abs(b["oracle_loss"] - b["alone_loss"])
+        gain_loss = (b["alone_loss"] - fed_metrics["loss"]) / loss_denom if loss_denom != 0 else 0.0
+        
+        records.append({
+            "Seed": seed,
+            "Scenario": scenario,
+            "Mechanism": mech,
+            "Client": c_id,
+            "P1_Param": p1_val,
+            "P2_Param": p2_val,
+            "Acc_Oracle": b["oracle_acc"],
+            "Acc_Alone": b["alone_acc"],
+            "Acc_Fed": fed_metrics["accuracy"],
+            "Gain_Acc": gain_acc,
+            "Loss_Oracle": b["oracle_loss"],
+            "Loss_Alone": b["alone_loss"],
+            "Loss_Fed": fed_metrics["loss"],
+            "Gain_Loss": gain_loss
+        })
+        
+    del model1, model2, c1, c2, t1, t2, te1, te2
+    gc.collect()
+    return records
 
-    # Check if splits already exist
-    splits_exist = (
-        os.path.exists(os.path.join(args.data_root, "full", "data_2_split", "0_train")) and
-        os.path.exists(os.path.join(args.data_root, "p1", "data_2_split", "0_train")) and
-        os.path.exists(os.path.join(args.data_root, "p2", "data_2_split", "0_train"))
-    )
+def generate_outputs(df, csv_dir, plot_dir):
+    """
+    Splits CSVs by case and generates Mean+STD Heatmaps exclusively for Accuracy.
+    Implements a custom Red-White-Green colormap with independent domain scaling 
+    to properly visualize the Nash Equilibrium boundary of collaborative learning.
+    """
+    os.makedirs(csv_dir, exist_ok=True)
+    os.makedirs(os.path.join(plot_dir, "dp"), exist_ok=True)
+    os.makedirs(os.path.join(plot_dir, "sup"), exist_ok=True)
+    
+    # --- DEFINE CUSTOM COLORMAP: Red -> White -> Green ---
+    # White centers cleanly at 0.0, highlighting beneficial collaboration (Green) 
+    # and privacy-induced utility collapse (Red) without muddy yellow artifacts.
+    rwg_cmap = LinearSegmentedColormap.from_list("RedWhiteGreen", ["#d73027", "#ffffff", "#1a9850"])
+    
+    for mech in df['Mechanism'].unique():
+        for scenario in df['Scenario'].unique():
+            # 1. Output Individual CSVs
+            sub_df = df[(df['Mechanism'] == mech) & (df['Scenario'] == scenario)]
+            if sub_df.empty: 
+                continue
+            
+            clean_scenario = SCENARIO_MAP[scenario]
+            csv_filename = os.path.join(csv_dir, f"{mech}_{clean_scenario}.csv")
+            sub_df.to_csv(csv_filename, index=False)
+            print(f"📁 Saved CSV: {csv_filename}")
+            
+            # 2. Output Heatmaps for Accuracy Gain (Mean + STD)
+            for client in df['Client'].unique():
+                client_sub = sub_df[sub_df['Client'] == client]
+                if client_sub.empty: 
+                    continue
+                
+                # Calculate Mean and Standard Deviation across the 10 seeds
+                pivot_mean = client_sub.pivot_table(index='P1_Param', columns='P2_Param', values='Gain_Acc', aggfunc='mean')
+                pivot_std = client_sub.pivot_table(index='P1_Param', columns='P2_Param', values='Gain_Acc', aggfunc='std').fillna(0)
+                
+                # --- DYNAMIC TWO-SLOPE NORMALIZATION ---
+                v_min = pivot_mean.values.min()
+                v_max = pivot_mean.values.max()
+                
+                # TwoSlopeNorm strictly requires vmin < vcenter < vmax. 
+                # We inject a negligible mathematical buffer if a specific client's 
+                # matrix happens to be entirely positive or entirely negative.
+                if v_min >= 0:
+                    v_min = -1e-3
+                if v_max <= 0:
+                    v_max = 1e-3
+                    
+                norm = TwoSlopeNorm(vmin=v_min, vcenter=0, vmax=v_max)
+                # ---------------------------------------
 
-    if splits_exist:
-        print("\nExisting splits detected at data_root. Skipping data loading and split creation.")
-        splits = {
-            "full": os.path.join(args.data_root, "full"),
-            "p1":   os.path.join(args.data_root, "p1"),
-            "p2":   os.path.join(args.data_root, "p2"),
-        }
-        # Load training data to determine n_train
-        x_tr, y_tr = load_split_xy(splits["full"], 0, "train")
-        n_train = x_tr.shape[0]
-        print(f"Training set : {n_train:,} samples | {x_tr.shape[1]:,} features | {y_tr.shape[1]:,} tasks")
-    else:
-        print("\nLoading data ...")
-        ecfp_tr, ic50_tr, ecfp_va, ic50_va = du.load_data(args.data_path)
-        ecfp_tr, ecfp_va = du.fold_input(ecfp_tr, INPUT_SIZE), du.fold_input(ecfp_va, INPUT_SIZE)
+                # Create custom text annotations: "Mean \n ±STD"
+                annot_matrix = np.empty(pivot_mean.shape, dtype=object)
+                for i in range(pivot_mean.shape[0]):
+                    for j in range(pivot_mean.shape[1]):
+                        annot_matrix[i, j] = f"{pivot_mean.iloc[i, j]:.3f}\n±{pivot_std.iloc[i, j]:.3f}"
+                
+                plt.figure(figsize=(9, 7))
+                
+                # Render heatmap with custom palette and independent domain scaling
+                sns.heatmap(
+                    pivot_mean, 
+                    annot=annot_matrix, 
+                    fmt="", 
+                    cmap=rwg_cmap,
+                    norm=norm,
+                    annot_kws={"size": 10},
+                    cbar_kws={'label': 'Empirical Accuracy Gain'}
+                )
+                
+                clean_client = CLIENT_MAP[scenario][client]
+                
+                plt.title(f"Accuracy Gain - {clean_scenario.upper()} - {clean_client} ({mech.upper()})\n(Mean ± STD over 10 Seeds)")
+                plt.xlabel(f"P2 Privacy Parameter ({mech.upper()})")
+                plt.ylabel(f"P1 Privacy Parameter ({mech.upper()})")
+                
+                # Retaining your target nomenclature structure
+                plot_filename = os.path.join(plot_dir, mech, f"{clean_scenario}_{clean_client}_{mech}.png")
+                plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+                plt.close()
+                print(f"📊 Saved Plot: {plot_filename}")
 
-        if args.n_samples is not None:
-            print(f"Subsampling to {args.n_samples:,} training rows ...")
-            ecfp_tr, ic50_tr = subsample(ecfp_tr, ic50_tr, n=args.n_samples, seed=0)
+def save_runtime_report(runtime_path, formatted_time, total_seconds):
+    os.makedirs(os.path.dirname(runtime_path), exist_ok=True)
+    with open(runtime_path, "w", encoding="utf-8") as handle:
 
-        n_train = ecfp_tr.shape[0]
-        print(f"Training set : {n_train:,} samples | {ecfp_tr.shape[1]:,} features | {ic50_tr.shape[1]:,} tasks")
+        handle.write(f"Total Runtime: {formatted_time} (HH:MM:SS)\n")
+        handle.write(f"Total Seconds: {total_seconds}\n")
 
-        print("\nPreparing fixed data splits ...")
-        splits = prepare_fixed_splits(ecfp_tr, ic50_tr, overlap=args.overlap, root=args.data_root)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--out_csv_dir", type=str, default="src/Results/CSVs/")
+    parser.add_argument("--out_plot_dir", type=str, default="src/Results/Plots/")
+    parser.add_argument("--out_runtime_file", type=str, default="src/Results/runtime.txt")
+    parser.add_argument("--seed_range", type=int, default=10) # Set to 10 seeds
+    parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--workers", type=int, default=4)
+    args = parser.parse_args()
 
-    base_conf = make_base_conf(n_train, rounds=args.rounds)
-    share_all_layers = (args.overlap == OUTPUT_SIZE)
-    dp_clip = estimate_dp_clip(base_conf, data_dir=splits["full"], device=device, n_batches=args.clip_batches, share_all_layers=share_all_layers)
+    start_time = time.time()
+    print(f"===========================================================")
+    print(f" 🚀 STARTING FULL EXPERIMENT SUITE ({args.seed_range} Seeds)")
+    print(f"===========================================================")
 
-    dp_cells, sup_cells = len(dp_noise_levels)**2, len(sup_levels)**2
-    total_runs = args.seed_range * 3 * (dp_cells + sup_cells + 4)
-    print(f"\nConfiguration:\n  seeds        : {args.seed_range}\n  rounds       : {args.rounds}\n  overlap      : {args.overlap}")
-    print(f"  batch_size   : {base_conf.batch_size}\n  n_train      : {n_train:,}\n  dp_clip      : {dp_clip:.6f}  (auto-estimated)")
-    print(f"  DP  grid     : {len(dp_noise_levels)}×{len(dp_noise_levels)} = {dp_cells} cells")
-    print(f"  SUP grid     : {len(sup_levels)}×{len(sup_levels)} = {sup_cells} cells")
-    print(f"  Total Flower FL runs : ~{total_runs:,}")
+    tasks = []
+    for seed in range(1, args.seed_range + 1):
+        for scenario in SCENARIOS:
+            data_path = os.path.join(args.data_root, f"{scenario}/data_2_split/")
+            if not os.path.exists(data_path):
+                print(f"Skipping {scenario}: Path {data_path} does not exist.")
+                continue
+                
+            print(f"\n--- Computing Local Baselines [Seed {seed}/10] [{scenario}] ---")
+            baselines = {
+                0: train_and_eval_local_baseline(data_path, 0, seed, args.rounds),
+                1: train_and_eval_local_baseline(data_path, 1, seed, args.rounds)
+            }
+            
+            for mech in MECHANISMS:
+                privacy_params = PRIVACY_PARAMS_BY_MECH[mech]
+                for p1_val in privacy_params:
+                    for p2_val in privacy_params:
+                        tasks.append({
+                            "seed": seed, "scenario": scenario, "mech": mech,
+                            "p1_val": p1_val, "p2_val": p2_val,
+                            "data_path": data_path, "args": args, "baselines": baselines
+                        })
 
-    seed_range = range(args.seed_start, args.seed_start + args.seed_range)
-    run_all(splits, base_conf, seed_range, dp_noise_levels, sup_levels, dp_clip, args, loss_fn, device, share_all_layers)
+    if not tasks:
+        print("No tasks generated. Check your --data_root path.")
+        return
+
+    all_records = []
+    print(f"\n⚡ Dispatching {len(tasks)} FL combinations across {args.workers} CPUs...")
+    
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=args.workers, mp_context=ctx) as executor:
+        futures = {executor.submit(worker_task, task): task for task in tasks}
+        
+        completed = 0
+        for future in as_completed(futures):
+            try:
+                records = future.result()
+                all_records.extend(records)
+                completed += 1
+                if completed % 50 == 0:
+                    print(f"   ... Progress: {completed}/{len(tasks)} simulations completed.")
+            except Exception as e:
+                print(f"Grid Task Failed: {e}")
+
+    if all_records:
+        df = pd.DataFrame(all_records)
+        generate_outputs(df, args.out_csv_dir, args.out_plot_dir)
+
+    # Calculate and Output Total Runtime
+    end_time = time.time()
+    total_seconds = int(end_time - start_time)
+    formatted_time = str(datetime.timedelta(seconds=total_seconds))
+    save_runtime_report(args.out_runtime_file, formatted_time, total_seconds)
+    
+    print(f"\n===========================================================")
+    print(f" 🎉 EXPERIMENT COMPLETE")
+    print(f" ⏱️  Total Runtime: {formatted_time} (HH:MM:SS)")
+    print(f"===========================================================")
+
+if __name__ == "__main__":
+    main()
