@@ -8,7 +8,7 @@ from sklearn.metrics import accuracy_score
 
 def get_parameters(model):
     """
-    Extracts ALL network weights (Both the 160-neuron Trunk and the 2808-neuron Head).
+    Extracts ALL network weights (Both the 40-neuron Trunk and the 2808-neuron Head).
     Because all tasks overlap, nothing is kept private.
     """
     return [val.cpu().numpy() for _, val in model.state_dict().items()]
