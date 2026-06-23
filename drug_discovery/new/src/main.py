@@ -166,7 +166,7 @@ def worker_task(kwargs):
     for c_id, fed_metrics in zip([0, 1], [fed_metrics_1, fed_metrics_2]):
         b = baselines[c_id]
         
-        acc_denom = abs(b["oracle_acc"] - b["alone_acc"])
+        acc_denom = 1.0 - b["alone_acc"]
         gain_acc = (fed_metrics["accuracy"] - b["alone_acc"]) / acc_denom if acc_denom != 0 else 0.0
         
         loss_denom = abs(b["oracle_loss"] - b["alone_loss"])
@@ -238,9 +238,9 @@ def generate_outputs(df, csv_dir, plot_dir):
                 # We inject a negligible mathematical buffer if a specific client's 
                 # matrix happens to be entirely positive or entirely negative.
                 if v_min >= 0:
-                    v_min = -1e-3
+                    v_min = -1e-2
                 if v_max <= 0:
-                    v_max = 1e-3
+                    v_max = 1e-2
                     
                 norm = TwoSlopeNorm(vmin=v_min, vcenter=0, vmax=v_max)
                 # ---------------------------------------
