@@ -4,6 +4,7 @@ import argparse
 import csv
 import time
 import datetime
+import random
 import numpy as np
 import torch
 import flwr as fl
@@ -19,7 +20,12 @@ import gc
 
 # Inject local paths
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path: sys.path.insert(0, PROJECT_ROOT)
+SPARSECHEM_ROOT = os.path.join(PROJECT_ROOT, "packages", "sparsechem")
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if SPARSECHEM_ROOT not in sys.path:
+    sys.path.insert(0, SPARSECHEM_ROOT)
 
 import sparsechem as sc
 from client import DrugDiscoveryClient, get_parameters, set_parameters
@@ -31,9 +37,14 @@ from dataset import get_client_datasets
 MECHANISMS = ["sup", "dp"]
 SCENARIOS = ["full", "p1", "p2"]
 
+# PRIVACY_PARAMS_BY_MECH = {
+#     "dp": [0.0, 0.001, 0.01, 0.1, 1.0],
+#     "sup": [0.0, 0.2, 0.4, 0.6, 0.8],
+# }
+
 PRIVACY_PARAMS_BY_MECH = {
-    "dp": [0.0, 0.001, 0.01, 0.1, 1.0],
-    "sup": [0.0, 0.2, 0.4, 0.6, 0.8],
+    "dp": [0.0, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10],
+    "sup": [0.0, 0.65, 0.70, 0.72, 0.74, 0.76, 0.80],
 }
 
 # Name mapping for clean outputs
@@ -48,6 +59,22 @@ CLIENT_MAP = {
     "p1": {0: "P11", 1: "P12"},
     "p2": {0: "P21", 1: "P22"}
 }
+
+def set_deterministic_environment(seed):
+    """
+    Locks all entropy sources for reproducible research.
+    Must be called at the initialization of any isolated worker process.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 class DummyClientProxy(fl.server.client_proxy.ClientProxy):
     def __init__(self, cid):
@@ -78,11 +105,13 @@ def make_base_conf():
 
 def train_and_eval_local_baseline(data_path, client_id, seed, rounds):
     """Establishes Oracle and Alone baselines."""
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    set_deterministic_environment(seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     conf = make_base_conf()
+    conf.seed = seed
+    
     train_ds, test_ds = get_client_datasets(data_path, client_id, 0.0, 'none', conf, seed)
     
     model = sc.TrunkAndHead(conf=conf, trunk=sc.Trunk(conf)).to(device)
@@ -109,8 +138,6 @@ def train_and_eval_local_baseline(data_path, client_id, seed, rounds):
 
 def worker_task(kwargs):
     """Isolated worker process for FL Grid execution."""
-    # EXTREMELY IMPORTANT FOR MULTIPROCESSING RUNTIME: 
-    # Prevent PyTorch from spawning hundreds of background threads that gridlock the CPU
     torch.set_num_threads(1)
     
     seed = kwargs["seed"]
@@ -122,10 +149,11 @@ def worker_task(kwargs):
     args = kwargs["args"]
     baselines = kwargs["baselines"]
     
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    set_deterministic_environment(seed)
     
     conf = make_base_conf()
+    conf.seed = seed
+
     loss_fn = torch.nn.BCEWithLogitsLoss(reduction="none")
     
     t1, te1 = get_client_datasets(data_path, 0, p1_val, mech, conf, seed)

@@ -47,8 +47,13 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
+
+        g = torch.Generator()
+        if hasattr(self.conf, 'seed'):
+            g.manual_seed(self.conf.seed) 
+
         train_loader = torch.utils.data.DataLoader(
-            self.train_dataset, batch_size=self.conf.batch_size, shuffle=True, collate_fn=sc.sparse_collate
+            self.train_dataset, batch_size=self.conf.batch_size, shuffle=True, collate_fn=sc.sparse_collate, generator=g
         )
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.conf.lr, weight_decay=self.conf.weight_decay)
         
@@ -71,11 +76,25 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
                     # Differential Privacy Injection
                     if self.privacy_mode == 'dp' and self.privacy_param > 0.0:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.dp_clip)
-                        noise_scale = self.dp_clip * self.privacy_param
-                        for param in self.model.parameters():
-                            if param.grad is not None:
-                                noise = torch.normal(mean=0.0, std=noise_scale, size=param.grad.size(), device=self.device)
-                                param.grad += noise
+                        
+                        # Apply the article's transformation: sigma = p / (1 - p)
+                        if self.privacy_param >= 1.0:
+                            sigma = float('inf') # Absolute privacy protection
+                        else:
+                            sigma = self.privacy_param / (1.0 - self.privacy_param)
+                        
+                        if sigma < float('inf'):
+                            noise_scale = self.dp_clip * sigma
+                            for param in self.model.parameters():
+                                if param.grad is not None:
+                                    noise = torch.normal(mean=0.0, std=noise_scale, size=param.grad.size(), device=self.device)
+                                    param.grad += noise
+                        else:
+                            # If privacy is 1.0 (infinite noise), gradients are effectively obliterated.
+                            # We simulate this by zeroing them out so no collaborative learning occurs.
+                            for param in self.model.parameters():
+                                if param.grad is not None:
+                                    param.grad.zero_()
 
                     optimizer.step()
 
