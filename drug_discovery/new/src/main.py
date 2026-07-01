@@ -43,8 +43,8 @@ SCENARIOS = ["full", "p1", "p2"]
 # }
 
 PRIVACY_PARAMS_BY_MECH = {
-    "dp": [0.0, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10],
-    "sup": [0.0, 0.65, 0.70, 0.72, 0.74, 0.76, 0.80],
+    "dp":[0.0, 0.04, 0.08, 0.12, 0.20, 0.35, 0.50],
+    "sup": [0.0, 0.60, 0.70, 0.75, 0.85, 0.95, 0.97],
 }
 
 # Name mapping for clean outputs
@@ -306,10 +306,16 @@ def generate_outputs(df, csv_dir, plot_dir):
 
 def save_runtime_report(runtime_path, formatted_time, total_seconds):
     os.makedirs(os.path.dirname(runtime_path), exist_ok=True)
-    with open(runtime_path, "w", encoding="utf-8") as handle:
 
+    with open(runtime_path, "a", encoding="utf-8") as handle:
+        handle.write("=" * 60 + "\n")
+        handle.write(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         handle.write(f"Total Runtime: {formatted_time} (HH:MM:SS)\n")
         handle.write(f"Total Seconds: {total_seconds}\n")
+        handle.write(f"Privacy Parameters by Mechanism:\n")
+        for mech, params in PRIVACY_PARAMS_BY_MECH.items():
+            handle.write(f"  {mech}: {params}\n")
+        handle.write("\n")
 
 def main():
     parser = argparse.ArgumentParser()
