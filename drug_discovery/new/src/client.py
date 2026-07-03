@@ -79,22 +79,16 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
                         
                         # Apply the article's transformation: sigma = p / (1 - p)
                         if self.privacy_param >= 1.0:
-                            sigma = float('inf') # Absolute privacy protection
+                            # Clamp to massive noise for absolute privacy.
+                            sigma = 10000.0 
                         else:
                             sigma = self.privacy_param / (1.0 - self.privacy_param)
                         
-                        if sigma < float('inf'):
-                            noise_scale = self.dp_clip * sigma
-                            for param in self.model.parameters():
-                                if param.grad is not None:
-                                    noise = torch.normal(mean=0.0, std=noise_scale, size=param.grad.size(), device=self.device)
-                                    param.grad += noise
-                        else:
-                            # If privacy is 1.0 (infinite noise), gradients are effectively obliterated.
-                            # We simulate this by zeroing them out so no collaborative learning occurs.
-                            for param in self.model.parameters():
-                                if param.grad is not None:
-                                    param.grad.zero_()
+                        noise_scale = self.dp_clip * sigma
+                        for param in self.model.parameters():
+                            if param.grad is not None:
+                                noise = torch.normal(mean=0.0, std=noise_scale, size=param.grad.size(), device=self.device)
+                                param.grad += noise
 
                     optimizer.step()
 
