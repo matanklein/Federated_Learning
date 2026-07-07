@@ -48,6 +48,9 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
     def fit(self, parameters, config):
         self.set_parameters(parameters)
 
+        if self.privacy_mode == 'dp' and self.privacy_param >= 1.0:
+            return self.get_parameters(config={}), len(self.train_dataset), {}
+
         g = torch.Generator()
         if hasattr(self.conf, 'seed'):
             g.manual_seed(self.conf.seed) 
@@ -73,22 +76,22 @@ class DrugDiscoveryClient(fl.client.NumPyClient):
                     loss = self.loss_fn(logits_subset, y_data).mean()
                     loss.backward()
 
-                    # Differential Privacy Injection
+                    # Differential Privacy Injection (Only for p < 1.0)
                     if self.privacy_mode == 'dp' and self.privacy_param > 0.0:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.dp_clip)
                         
-                        # Apply the article's transformation: sigma = p / (1 - p)
-                        if self.privacy_param >= 1.0:
-                            # Clamp to massive noise for absolute privacy.
-                            sigma = 10000.0 
-                        else:
-                            sigma = self.privacy_param / (1.0 - self.privacy_param)
-                        
+                        sigma = self.privacy_param / (1.0 - self.privacy_param)
                         noise_scale = self.dp_clip * sigma
+                        
                         for param in self.model.parameters():
                             if param.grad is not None:
-                                noise = torch.normal(mean=0.0, std=noise_scale, size=param.grad.size(), device=self.device)
-                                param.grad += noise
+                                noise = torch.normal(
+                                    mean=0.0, 
+                                    std=noise_scale, 
+                                    size=param.grad.size(), 
+                                    device=self.device
+                                )
+                                param.grad.add_(noise)
 
                     optimizer.step()
 
